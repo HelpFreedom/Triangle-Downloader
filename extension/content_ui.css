@@ -1,0 +1,121 @@
+/* Download button lives inside the player's right-controls, matching yt style */
+.ytdl-btn {
+  position: relative;
+  width: 40px; height: 100%;
+  vertical-align: top;
+  opacity: .9;
+}
+.ytdl-btn:hover { opacity: 1; }
+/* center the triangle glyph vertically and horizontally in the control */
+.ytdl-btn svg { width: 46%; height: 100%; display: block; margin: 0 auto; }
+
+/* fragment (start — end) row */
+.ytdl-frag {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px 10px;
+}
+.ytdl-time {
+  flex: 1 1 0;
+  min-width: 0;
+  background: rgba(255,255,255,.08);
+  border: 1px solid rgba(255,255,255,.15);
+  border-radius: 7px;
+  color: #fff;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  padding: 7px 6px;
+  outline: none;
+}
+.ytdl-time:focus { border-color: #7c5cff; background: rgba(255,255,255,.12); }
+.ytdl-frag-dash { color: #9aa0a6; }
+.ytdl-ext { color: #9aa0a6; font-size: 12px; margin-left: 4px; }
+
+.ytdl-menu {
+  position: fixed;
+  z-index: 2147483647;
+  background: rgba(28,28,28,.97);
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 12px;
+  padding: 6px;
+  min-width: 240px;
+  box-shadow: 0 8px 28px rgba(0,0,0,.55);
+  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
+}
+.ytdl-menu-head {
+  color: #9aa0a6;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  padding: 8px 12px 4px;
+}
+.ytdl-menu-item {
+  color: #fff;
+  padding: 9px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.ytdl-menu-item:hover { background: rgba(255,255,255,.12); }
+.ytdl-menu-item b { font-weight: 600; }
+
+.ytdl-menu-radio {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.ytdl-menu-radio:hover { background: rgba(255,255,255,.08); }
+.ytdl-dot {
+  flex: 0 0 auto;
+  width: 15px; height: 15px;
+  margin-top: 2px;
+  border-radius: 50%;
+  border: 2px solid #888;
+  box-sizing: border-box;
+  position: relative;
+}
+.ytdl-menu-radio.sel .ytdl-dot { border-color: #ff4e45; }
+.ytdl-menu-radio.sel .ytdl-dot::after {
+  content: ''; position: absolute;
+  inset: 2.5px; border-radius: 50%;
+  background: #ff4e45;
+}
+.ytdl-radio-txt { display: flex; flex-direction: column; }
+.ytdl-radio-txt b { color: #fff; font-size: 13.5px; font-weight: 600; }
+.ytdl-radio-txt i { color: #9aa0a6; font-size: 11.5px; font-style: normal; margin-top: 2px; line-height: 1.3; }
+.ytdl-menu-radio.sel .ytdl-radio-txt b { color: #ff6b63; }
+
+#ytdl-toast {
+  position: fixed;
+  right: 20px; bottom: 20px;
+  z-index: 2147483647;
+  width: 320px;
+  background: rgba(20,20,20,.96);
+  color: #fff;
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 12px;
+  padding: 14px 16px;
+  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
+  font-size: 13px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.55);
+  opacity: 0; transform: translateY(8px);
+  transition: opacity .2s, transform .2s;
+  pointer-events: none;
+}
+#ytdl-toast.show { opacity: 1; transform: translateY(0); }
+#ytdl-toast .ytdl-toast-txt { display: block; margin-bottom: 8px; line-height: 1.35; }
+#ytdl-toast .ytdl-toast-bar {
+  height: 6px; border-radius: 4px;
+  background: rgba(255,255,255,.15);
+  overflow: hidden;
+}
+#ytdl-toast .ytdl-toast-bar i {
+  display: block; height: 100%; width: 0%;
+  background: #ff4e45;
+  transition: width .2s;
+}

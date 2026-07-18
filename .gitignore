@@ -1,0 +1,15 @@
+# Dependencies / build artifacts
+node_modules/
+package.json
+package-lock.json
+
+# Editor / IDE
+.claude/
+.claude-ide/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+*~
