@@ -20,7 +20,12 @@
   const store = {
     videoId: null,
     capturing: false,
-    tracks: Object.create(null), // kind -> { mime, parts: Uint8Array[] }
+    tracks: Object.create(null),   // kind -> { mime, parts: Uint8Array[] }
+    // Latest init segment seen per track, kept UNGATED. Init segments usually arrive
+    // once at load (audio itag is the same Opus at every quality, so a quality switch
+    // does NOT re-init audio) — so we remember them and seed a track that starts
+    // receiving media mid-capture without a fresh init of its own.
+    lastInit: Object.create(null), // kind -> { bytes: Uint8Array, mime: string }
   };
 
   function vidId() { try { return new URLSearchParams(location.search).get('v'); } catch (e) { return null; } }
@@ -83,17 +88,26 @@
   const OrigAppend = SourceBuffer.prototype.appendBuffer;
   SourceBuffer.prototype.appendBuffer = function (data) {
     try {
-      if (store.capturing) {
-        const kind = this.__ytdlKind;
-        if (kind === 'video' || kind === 'audio') {
-          const u8 = u8of(data);
-          if (u8 && u8.length) {
+      const kind = this.__ytdlKind;
+      if (kind === 'video' || kind === 'audio') {
+        const u8 = u8of(data);
+        if (u8 && u8.length) {
+          const init = startsWithInit(u8);
+          // Always remember the latest init (ungated) — it usually only arrives at load.
+          if (init) store.lastInit[kind] = { bytes: u8.slice(), mime: this.__ytdlMime || '' };
+          if (store.capturing) {
             let t = store.tracks[kind];
             if (!t) {
-              // wait for the track's init chunk before we start concatenating
-              if (startsWithInit(u8)) t = store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [] };
+              if (init) {
+                t = store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [u8.slice()] };
+              } else if (store.lastInit[kind]) {
+                // media arrived without a fresh init → seed the track with the stored init
+                t = store.tracks[kind] = { mime: store.lastInit[kind].mime, parts: [store.lastInit[kind].bytes, u8.slice()] };
+              }
+              // else: no init available yet — skip until one appears
+            } else {
+              t.parts.push(u8.slice());
             }
-            if (t) t.parts.push(u8.slice());
           }
         }
       }
@@ -144,22 +158,16 @@
     return end;
   }
 
-  // Turn off "autoplay next" so reaching the end can't navigate away. Returns a
-  // function that restores the previous state, or null if nothing was changed.
-  function disableAutoplay() {
+  // Turn off YouTube's "Autoplay next" toggle. Called on load and on every
+  // navigation so the next video never starts on its own. Returns true once the
+  // toggle button exists (whether it was already off or we just switched it off).
+  function keepAutoplayOff() {
     try {
       const btn = document.querySelector('.ytp-autonav-toggle-button');
-      if (btn && btn.getAttribute('aria-checked') === 'true') {
-        btn.click();
-        return () => {
-          try {
-            const b = document.querySelector('.ytp-autonav-toggle-button');
-            if (b && b.getAttribute('aria-checked') !== 'true') b.click();
-          } catch (e) {}
-        };
-      }
-    } catch (e) {}
-    return null;
+      if (!btn) return false;
+      if (btn.getAttribute('aria-checked') === 'true') btn.click();
+      return true;
+    } catch (e) { return false; }
   }
 
   // Capture the whole selected quality by playing forward fast. The browser
@@ -177,25 +185,25 @@
     const capId = vidId();
 
     const prev = { paused: v.paused, rate: v.playbackRate, time: v.currentTime, muted: v.muted };
-    const restoreAutoplay = disableAutoplay();
+    keepAutoplayOff();
     try { v.muted = true; } catch (e) {}
     try { v.pause(); } catch (e) {}
 
     // Order matters:
-    //  1) switch to a low quality and SEEK TO 0 first, so the whole capture starts
-    //     from the very beginning of the video (not from wherever the user was).
-    //  2) then start recording and switch to the target quality — its init segment
-    //     is appended at position 0 while we record. record() only begins a track
-    //     on its init chunk, so leftover low-quality fragments are ignored.
+    //  1) switch to a low quality and seek to a NON-ZERO position (so position 0 is
+    //     left unbuffered). Seeking to 0 later is then a real jump that forces BOTH
+    //     tracks to re-fetch from the start — important because the audio itag is the
+    //     same Opus at every quality, so a quality switch alone won't re-init audio.
+    //  2) start recording, switch to the target quality, then seek to 0.
     setQualityRaw(preQ);
     await sleep(500);
-    seekVia(0);
-    await sleep(500);
+    seekVia(Math.min(35, dur * 0.4));
+    await sleep(700);
     resetTracks();
     store.capturing = true;
     setQualityRaw(targetQ);
     seekVia(0);
-    await sleep(400);
+    await sleep(500);
 
     // wait until the tracks we need have their init before entering the capture loop
     const haveInits = () => store.tracks.audio && (!needVideo || store.tracks.video);
@@ -243,7 +251,7 @@
       try { v.playbackRate = prev.rate; } catch (e) {}
       seekVia(prev.time);
       try { v.muted = prev.muted; } catch (e) {}
-      if (restoreAutoplay) restoreAutoplay();
+      keepAutoplayOff(); // leave autoplay disabled — don't turn it back on
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
     onProgress(1);
@@ -414,8 +422,26 @@
   });
 
   document.addEventListener('yt-navigate-finish', () => {
-    if (vidId() !== store.videoId) { store.videoId = vidId(); resetTracks(); store.capturing = false; }
+    if (vidId() !== store.videoId) {
+      store.videoId = vidId();
+      resetTracks();
+      store.lastInit = Object.create(null); // inits from the previous video are stale
+      store.capturing = false;
+    }
+    scheduleAutoplayOff();
   });
+
+  // Disable "Autoplay next" as soon as the player controls exist (they render a bit
+  // after load), and again after each navigation.
+  function scheduleAutoplayOff() {
+    let tries = 20;
+    (function tick() {
+      if (keepAutoplayOff() || tries-- <= 0) return;
+      setTimeout(tick, 1000);
+    })();
+  }
+  scheduleAutoplayOff();
+
   store.videoId = vidId();
   console.log('[YTDL] MSE capture hook installed');
 })();

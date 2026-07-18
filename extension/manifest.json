@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Triangle Downloader",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Скачивает открытое видео YouTube (720p/1080p mp4, mp3, выбор фрагмента), перехватывая поток самого плеера. Без yt-dlp и внешних сервисов.",
   "permissions": ["downloads", "offscreen", "storage"],
   "host_permissions": ["*://www.youtube.com/*"],

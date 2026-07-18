@@ -17,6 +17,8 @@ No `yt-dlp`, no third‑party sites or servers: everything runs locally in your 
 - **Subtitles** — `.txt` without timecodes. Prefers Russian, otherwise any available language.
 - **Video format** — "Fast" (VP9 in mp4, no re‑encoding, seconds) or "H.264" (re‑encode for
   compatibility with older players, slow).
+- **Auto‑disables Autoplay** — the extension turns off YouTube's "Autoplay next" so the next
+  video won't start on its own.
 
 ## ⚠️ Requirements
 
