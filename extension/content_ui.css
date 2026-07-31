@@ -41,6 +41,8 @@
   border-radius: 12px;
   padding: 6px;
   min-width: 240px;
+  max-height: 70vh;
+  overflow-y: auto;
   box-shadow: 0 8px 28px rgba(0,0,0,.55);
   font-family: "YouTube Sans", Roboto, Arial, sans-serif;
 }

@@ -182,7 +182,6 @@
     const dur = v.duration;
     if (!isFinite(dur) || dur <= 0) throw new Error('duration unknown');
     const capEnd = Math.min(opts.end && opts.end > 0 ? opts.end : dur, dur);
-    const capStart = Math.max(0, Math.min(opts.start || 0, Math.max(0, capEnd - 1)));
     const capId = vidId();
 
     const prev = { paused: v.paused, rate: v.playbackRate, time: v.currentTime, muted: v.muted };
@@ -190,22 +189,26 @@
     try { v.muted = true; } catch (e) {}
     try { v.pause(); } catch (e) {}
 
+    // Every seek we make goes through goTo so we remember where we asked the
+    // playhead to be. Anything further ahead than that was moved by someone else
+    // (see the external-skip rescue in the capture loop below).
+    let lastReq = v.currentTime;
+    const goTo = (t) => { lastReq = t; seekVia(t); };
+
     // Order matters:
-    //  1) switch to a low quality and seek to a position clearly DIFFERENT from
-    //     capStart, so that seeking to capStart afterwards is a real jump. That jump
-    //     forces BOTH tracks to re-fetch — important because the audio itag is the
+    //  1) switch to a low quality and seek to a NON-ZERO position (so position 0 is
+    //     left unbuffered). Seeking to 0 later is then a real jump that forces BOTH
+    //     tracks to re-fetch from the start — important because the audio itag is the
     //     same Opus at every quality, so a quality switch alone won't re-init audio.
-    //  2) start recording, switch to the target quality, then seek to capStart.
-    //     Capture begins at the requested fragment — not at the start of the video.
-    const preSeek = capStart > 10 ? 0 : Math.min(35, Math.max(1, dur - 5));
+    //  2) start recording, switch to the target quality, then seek to 0.
     setQualityRaw(preQ);
     await sleep(500);
-    seekVia(preSeek);
+    goTo(Math.min(35, dur * 0.4));
     await sleep(700);
     resetTracks();
     store.capturing = true;
     setQualityRaw(targetQ);
-    seekVia(capStart);
+    goTo(0);
     await sleep(500);
 
     // wait until the tracks we need have their init before entering the capture loop
@@ -224,44 +227,57 @@
       }
       return t;
     };
-    // Where the captured data actually begins: the player can only start at a segment
-    // boundary at or before capStart, so the file may lead in by a few seconds. The
-    // caller needs this to trim RELATIVE to the file (ffmpeg's -ss counts from the
-    // file's own start, not from the video's absolute timeline).
-    const bufferedStartAt = (t) => {
-      for (let i = 0; i < v.buffered.length; i++) {
-        if (v.buffered.start(i) <= t + 0.5 && v.buffered.end(i) >= t) return v.buffered.start(i);
-      }
-      return t;
-    };
-    let capturedFrom = capStart;
-    let cursor = capStart, stall = 0;
-    const span = Math.max(0.1, capEnd - capStart);
+    let cursor = 0, stall = 0, rescues = 0;
     const started = Date.now();
     try {
       try { v.pause(); } catch (e) {}
-      capturedFrom = Math.min(capStart, bufferedStartAt(capStart));
       while (true) {
         await sleep(350);
         if (vidId() !== capId) throw new Error('видео переключилось во время захвата');
         try { if (!v.paused) v.pause(); } catch (e) {} // keep it paused; buffering runs anyway
 
+        // --- external skip rescue ------------------------------------------
+        // Another extension (typically the standalone SponsorBlock) jumps the
+        // playhead over sponsor segments. The skipped range is then never fetched,
+        // the contiguous buffer edge stops growing at the segment start, and the
+        // capture hangs there forever. The video is paused during capture, so ANY
+        // forward jump beyond what we asked for is external. Pull the playhead back:
+        // already-buffered ranges are not re-fetched (no duplicated bytes), and
+        // SponsorBlock does not re-skip a segment it has already skipped once.
+        if (v.currentTime > lastReq + 2) {
+          rescues++;
+          console.warn('[YTDL] внешняя перемотка ' + lastReq.toFixed(1) + ' → ' +
+            v.currentTime.toFixed(1) + ' — возвращаю плейхед (' + rescues + ')');
+          if (rescues > 20) {
+            throw new Error('стороннее расширение перематывает видео (SponsorBlock?) — ' +
+              'отключите его на youtube.com: встроенное вырезание уже есть здесь');
+          }
+          goTo(Math.min(cursor, capEnd - 0.1));
+          stall = 0;
+          continue;
+        }
+
         const edge = bufferedEndAt(cursor);
-        onProgress(Math.min(0.99, Math.max(0, edge - capStart) / span));
-        if (edge >= capEnd - 0.6) break;                 // range fully buffered → captured
+        onProgress(Math.min(0.99, edge / capEnd));
+        if (edge >= capEnd - 0.6) break;                 // fully buffered → captured
 
         if (edge > cursor + 0.3) {                       // window extended → hop to the edge
           cursor = edge;
-          seekVia(Math.min(cursor, capEnd - 0.1));
+          goTo(Math.min(cursor, capEnd - 0.1));
           stall = 0;
         } else {                                         // plateaued → nudge to re-trigger fetch
           stall++;
-          if (stall % 4 === 0) seekVia(Math.min(cursor + 0.1, capEnd - 0.1));
-          if (stall >= 60) break;                        // ~21s with no progress → give up
+          if (stall % 4 === 0) goTo(Math.min(cursor + 0.1, capEnd - 0.1));
+          if (stall >= 60) {                             // ~21s with no progress → give up
+            if (rescues > 0) {
+              throw new Error('захват встал на отрезке, который пропускает стороннее ' +
+                'расширение (SponsorBlock?) — отключите его на youtube.com');
+            }
+            break;
+          }
         }
         if (Date.now() - started > 20 * 60 * 1000) break; // hard cap
       }
-      capturedFrom = Math.min(capturedFrom, bufferedStartAt(capStart));
     } finally {
       store.capturing = false;
       // restore player state
@@ -272,7 +288,6 @@
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
     onProgress(1);
-    return { capturedFrom: Math.max(0, capturedFrom) };
   }
 
   // ---- subtitles (read from the built-in transcript panel) -----------------
@@ -395,7 +410,7 @@
   // ---- bridge to the isolated-world UI script ------------------------------
   window.addEventListener('message', async (ev) => {
     if (ev.source !== window || !ev.data || ev.data.__ytdl_to_hook !== true) return;
-    const { cmd, reqId, height, format, start, end } = ev.data;
+    const { cmd, reqId, height, format, end } = ev.data;
     const reply = (payload, transfer) => window.postMessage(
       Object.assign({ __ytdl_from_hook: true, reqId }, payload), '*', transfer || []);
     try {
@@ -413,17 +428,13 @@
         // (360p) to save bandwidth while keeping video/audio as separate tracks.
         const targetQ = isMp3 ? 'medium' : (Q[height] || 'hd720');
         const preQ = (targetQ === 'small' || targetQ === 'tiny' || targetQ === 'medium') ? 'tiny' : 'medium';
-        const cap = await playthrough(
-          { targetQ, preQ, start, end, needVideo: !isMp3 },
+        await playthrough(
+          { targetQ, preQ, end, needVideo: !isMp3 },
           (pct) => reply({ progress: pct, phase: 'buffering' }));
 
         const aud = assemble('audio');
         if (!aud) throw new Error('не удалось захватить аудио');
-        const payload = {
-          ok: true, done: true,
-          capturedFrom: cap.capturedFrom,   // where the captured file actually begins
-          audio: { mime: aud.mime, size: aud.bytes.byteLength },
-        };
+        const payload = { ok: true, done: true, audio: { mime: aud.mime, size: aud.bytes.byteLength } };
         const transfers = [aud.bytes.buffer];
         payload._a = aud.bytes.buffer;
         if (!isMp3) {

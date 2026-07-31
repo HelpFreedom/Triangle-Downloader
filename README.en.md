@@ -25,6 +25,8 @@ No `yt-dlp`, no third‑party sites or servers: everything runs locally in your 
   compatibility with older players, slow).
 - **Auto‑disables Autoplay** — the extension turns off YouTube's "Autoplay next" so the next
   video won't start on its own.
+- **SponsorBlock** — optionally removes sponsor segments, self-promotion, and interaction
+  reminders; lookups use k-anonymity and never send the complete video ID.
 
 ## ⚠️ Requirements
 
