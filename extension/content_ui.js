@@ -333,27 +333,69 @@
     return btoa(s);
   }
 
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // The ffmpeg side lives in an offscreen document that the service worker creates on
+  // demand. Only that document answers begin/chunk/finalize, so sending before it is
+  // listening rejects with a bare "message port closed". Wait for it to answer a ping
+  // first — and give a failed send one more try, since the worker may have been asleep.
+  async function offscreenReady(timeoutMs = 8000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      try {
+        const r = await chrome.runtime.sendMessage({ t: 'ytdl-ping' });
+        if (r && r.ok) return true;
+      } catch (e) { /* not listening yet */ }
+      await wait(200);
+    }
+    return false;
+  }
+
+  async function sendToOffscreen(msg, retries = 1) {
+    let lastErr = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const r = await chrome.runtime.sendMessage(msg);
+        if (r) return r;                     // includes negative answers — those are real
+        lastErr = new Error('нет ответа от обработчика');
+      } catch (e) { lastErr = e; }
+      if (attempt < retries) {
+        try { await chrome.runtime.sendMessage({ t: 'ytdl-ensure' }); } catch (e) {}
+        await wait(300);
+      }
+    }
+    throw lastErr || new Error('обработчик ffmpeg не отвечает');
+  }
+
   async function muxViaOffscreen(job) {
     const CHUNK = 4 * 1024 * 1024;
     await chrome.runtime.sendMessage({ t: 'ytdl-ensure' });
-    await chrome.runtime.sendMessage({
+    if (!await offscreenReady()) throw new Error('обработчик ffmpeg не запустился');
+
+    await sendToOffscreen({
       t: 'ytdl-begin', filename: job.filename, format: job.format,
       videoMime: job.videoMime, audioMime: job.audioMime,
       transcode: !!job.transcode, quickEncode: !!job.quickEncode,
       trimStart: job.trimStart || 0, trimDuration: job.trimDuration || 0,
     });
+
+    let seq = 0; // lets the receiver drop a repeated chunk instead of doubling the data
     const sendTrack = async (name, buf) => {
       if (!buf) return;
       const view = new Uint8Array(buf);
       for (let off = 0; off < view.length; off += CHUNK) {
         const slice = view.subarray(off, Math.min(off + CHUNK, view.length));
-        const r = await chrome.runtime.sendMessage({ t: 'ytdl-chunk', track: name, b64: b64encode(slice) });
-        if (!r || !r.ok) throw new Error('передача данных прервалась (' + name + ')');
+        const r = await sendToOffscreen({ t: 'ytdl-chunk', track: name, seq, b64: b64encode(slice) });
+        if (!r || !r.ok) {
+          throw new Error('передача данных прервалась (' + name + ')' + (r && r.error ? ': ' + r.error : ''));
+        }
+        seq++;
       }
     };
     await sendTrack('video', job.video);
     await sendTrack('audio', job.audio);
-    return chrome.runtime.sendMessage({ t: 'ytdl-finalize' });
+    // No retry here: a repeated finalize would re-run ffmpeg on already-freed data.
+    return sendToOffscreen({ t: 'ytdl-finalize' }, 0);
   }
 
   const mo = new MutationObserver(() => ensureButton());

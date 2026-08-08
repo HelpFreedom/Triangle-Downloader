@@ -8,7 +8,7 @@ const { FFmpeg } = FFmpegWASM;
 
 let ff = null;
 let ffLoading = null;
-const acc = { video: [], audio: [], videoMime: '', audioMime: '', filename: 'video.mp4' };
+const acc = { video: [], audio: [], videoMime: '', audioMime: '', filename: 'video.mp4', seq: 0 };
 const ffLog = []; // ring buffer of recent ffmpeg log lines for error reporting
 
 async function getFF() {
@@ -173,8 +173,13 @@ async function finalize() {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg.t !== 'string') return;
 
+  // Readiness probe: the sender waits for this before streaming anything, because the
+  // service worker resolves createDocument() and only this listener proves the document
+  // is actually able to receive.
+  if (msg.t === 'ytdl-ping') { sendResponse({ ok: true }); return; }
+
   if (msg.t === 'ytdl-begin') {
-    acc.video = []; acc.audio = [];
+    acc.video = []; acc.audio = []; acc.seq = 0;
     acc.videoMime = msg.videoMime || '';
     acc.audioMime = msg.audioMime || '';
     acc.filename = msg.filename || 'video.mp4';
@@ -190,7 +195,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.t === 'ytdl-chunk') {
     try {
+      // Chunks are numbered so a retried one can be recognised. Re-applying a chunk
+      // whose answer was lost in transit would silently double the data and corrupt
+      // the file, and a gap means the document was recreated mid-transfer — better to
+      // fail loudly than to write a broken video.
+      const seq = Number(msg.seq);
+      if (Number.isFinite(seq)) {
+        if (seq < acc.seq) { sendResponse({ ok: true, duplicate: true }); return; }
+        if (seq > acc.seq) { sendResponse({ ok: false, error: 'пропущен фрагмент данных' }); return; }
+      }
       acc[msg.track].push(b64decode(msg.b64));
+      acc.seq++;
       sendResponse({ ok: true });
     } catch (e) {
       sendResponse({ ok: false, error: String(e) });
