@@ -289,17 +289,31 @@
     const tl = pr && pr.captions && pr.captions.playerCaptionsTracklistRenderer;
     return (tl && tl.captionTracks) || [];
   }
-  function expandedTranscriptPanel() {
-    return [...document.querySelectorAll('ytd-engagement-panel-section-list-renderer')]
-      .find(p => (p.getAttribute('target-id') || '').includes('transcript') &&
-                 p.getAttribute('visibility') === 'ENGAGEMENT_PANEL_VISIBILITY_EXPANDED');
+  // YouTube ships TWO transcript UIs and which one a video gets varies:
+  //  * legacy  — ytd-transcript-segment-renderer rows inside a panel whose target-id
+  //              contains "transcript", with a language picker in its footer;
+  //  * modern  — the "В этом видео" panel: transcript-segment-view-model rows, NO
+  //              target-id on the panel and NO language picker at all.
+  // Everything below therefore keys off the CONTENT (which rows exist), never off
+  // panel ids or class names, and supports both layouts.
+  function modernSegments() {
+    return [...document.querySelectorAll('transcript-segment-view-model')];
   }
-  // the ACTIVE segment list is the last one rendered (switching language appends a
-  // new list and leaves the old one behind — reading the last avoids duplicates)
-  function activeTranscriptList() {
+  // For the legacy list the ACTIVE one is the last rendered: switching language appends
+  // a new list and leaves the old one behind, so reading the last avoids duplicates.
+  function legacySegmentList() {
     const lists = document.querySelectorAll('ytd-transcript-segment-list-renderer');
     const last = lists[lists.length - 1];
     return last && last.querySelector('ytd-transcript-segment-renderer') ? last : null;
+  }
+  function transcriptReady() {
+    return modernSegments().length > 0 || !!legacySegmentList();
+  }
+  function expandedTranscriptPanel() {
+    return [...document.querySelectorAll('ytd-engagement-panel-section-list-renderer')]
+      .find(p => p.getAttribute('visibility') === 'ENGAGEMENT_PANEL_VISIBILITY_EXPANDED' &&
+                 (p.querySelector('transcript-segment-view-model') ||
+                  p.querySelector('ytd-transcript-segment-renderer')));
   }
   function findTranscriptButton() {
     return [...document.querySelectorAll('button')].find(b => {
@@ -307,18 +321,31 @@
       return /расшифровка видео|show transcript/i.test(a) && !/закрыть|close/i.test(a);
     });
   }
-  function findCloseTranscriptButton() {
-    return [...document.querySelectorAll('button')].find(b =>
-      /закрыть расшифров|close transcript/i.test(b.getAttribute('aria-label') || ''));
+  // The modern panel groups "Эпизоды" and "Расшифровка видео" as tabs — if it opens on
+  // the wrong tab there are no transcript rows until we switch to it.
+  function activateTranscriptTab() {
+    const panel = [...document.querySelectorAll('ytd-engagement-panel-section-list-renderer')]
+      .find(p => p.getAttribute('visibility') === 'ENGAGEMENT_PANEL_VISIBILITY_EXPANDED');
+    if (!panel) return false;
+    const tab = [...panel.querySelectorAll('button')].find(b =>
+      /расшифровка видео|transcript/i.test(b.getAttribute('aria-label') || b.textContent || ''));
+    if (!tab) return false;
+    try { tab.click(); return true; } catch (e) { return false; }
   }
   function closeTranscript() {
-    const btn = findCloseTranscriptButton();
+    // Scope to the transcript panel: the modern one labels its button just "Закрыть",
+    // and that label is used by many other panels on the page.
+    const panel = expandedTranscriptPanel();
+    const inPanel = panel && [...panel.querySelectorAll('button')].find(b =>
+      /закрыть|close/i.test(b.getAttribute('aria-label') || ''));
+    const btn = inPanel || [...document.querySelectorAll('button')].find(b =>
+      /закрыть расшифров|close transcript/i.test(b.getAttribute('aria-label') || ''));
     if (btn) { try { btn.click(); } catch (e) {} }
   }
   // One open attempt. Returns true when the transcript actually rendered segments.
   // YouTube sometimes lags and opens an empty panel — the caller retries.
   async function openTranscriptOnce() {
-    if (activeTranscriptList()) return true;
+    if (transcriptReady()) return true;
     let btn = findTranscriptButton();
     if (!btn) { // the button may live inside the collapsed description
       const more = document.querySelector('ytd-text-inline-expander #expand, #description #expand, tp-yt-paper-button#expand');
@@ -326,14 +353,19 @@
     }
     if (!btn) return false; // no transcript button on this video
     try { btn.click(); } catch (e) {}
-    for (let i = 0; i < 40 && !activeTranscriptList(); i++) await sleep(150);
-    return !!activeTranscriptList();
+    for (let i = 0; i < 25 && !transcriptReady(); i++) await sleep(150);
+    if (!transcriptReady() && activateTranscriptTab()) {
+      for (let i = 0; i < 20 && !transcriptReady(); i++) await sleep(150);
+    }
+    return transcriptReady();
   }
   function transcriptLangLabel() {
     const panel = expandedTranscriptPanel();
     const f = panel && panel.querySelector('ytd-transcript-footer-renderer #label-text');
     return f ? f.textContent.trim() : '';
   }
+  // Only the legacy panel lets us pick a language; the modern one shows whatever
+  // YouTube picked and offers no control, so this is a no-op there.
   async function selectTranscriptLanguage(name) {
     if (!name || transcriptLangLabel() === name) return;
     const panel = expandedTranscriptPanel();
@@ -350,16 +382,28 @@
     await sleep(500); // let the new segment list render
   }
   function extractTranscriptText() {
-    const list = activeTranscriptList();
-    if (!list) return [];
     const lines = [];
+    const push = (raw) => {
+      const t = String(raw || '').replace(/\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim();
+      if (!t) return;
+      if (lines.length && lines[lines.length - 1] === t) return; // drop repeated cues
+      lines.push(t);
+    };
+    const modern = modernSegments();
+    if (modern.length) {
+      // each row is [timestamp div][screen-reader label div][text span] — taking the
+      // whole row's textContent would glue "0:00" and "0 секунд" onto the text
+      for (const s of modern) {
+        const span = s.querySelector('span');
+        push(span ? span.textContent : (s.children[s.children.length - 1] || {}).textContent);
+      }
+      return lines;
+    }
+    const list = legacySegmentList();
+    if (!list) return [];
     for (const s of list.querySelectorAll('ytd-transcript-segment-renderer')) {
       const tx = s.querySelector('.segment-text, yt-formatted-string.segment-text');
-      if (!tx) continue;
-      const t = tx.textContent.replace(/\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim();
-      if (!t) continue;
-      if (lines.length && lines[lines.length - 1] === t) continue; // drop repeated cues
-      lines.push(t);
+      if (tx) push(tx.textContent);
     }
     return lines;
   }
@@ -371,24 +415,31 @@
             || tracks.find(t => t.languageCode === 'ru');
     const wantName = ru ? trackName(ru) : null;
 
-    let lines = [], lang = ru ? 'ru' : 'txt', lastErr = null;
+    let lines = [], lastErr = null;
     // Retry: YouTube occasionally opens an empty transcript. Close + reopen fresh.
     for (let attempt = 0; attempt < 3 && !lines.length; attempt++) {
       if (attempt > 0) { closeTranscript(); await sleep(800); }
       try {
         if (!(await openTranscriptOnce())) { lastErr = new Error('расшифровка не загрузилась'); continue; }
-        if (wantName) await selectTranscriptLanguage(wantName);
+        if (wantName) await selectTranscriptLanguage(wantName); // legacy panel only
         for (let i = 0; i < 20 && !extractTranscriptText().length; i++) await sleep(150);
         lines = extractTranscriptText();
-        if (lines.length && !ru) {
-          const match = tracks.find(t => trackName(t) === transcriptLangLabel());
-          lang = (match && match.languageCode) || (tracks[0].languageCode) || 'txt';
-        }
       } catch (e) { lastErr = e; }
     }
 
     closeTranscript(); // we're done — leave the player as we found it
     if (!lines.length) throw new Error((lastErr && lastErr.message) || 'не удалось получить расшифровку');
+
+    // Name the file after the language we actually got. The legacy panel states it;
+    // the modern one doesn't, so fall back to the text itself (Cyrillic → ru) and
+    // finally to the video's own caption list.
+    let lang = 'txt';
+    const byLabel = tracks.find(t => trackName(t) === transcriptLangLabel());
+    if (byLabel) lang = byLabel.languageCode;
+    else if (ru && /[Ѐ-ӿ]/.test(lines.slice(0, 30).join(' '))) lang = 'ru';
+    else if (tracks.length === 1) lang = tracks[0].languageCode || 'txt';
+    else lang = (tracks[0] && tracks[0].languageCode) || 'txt';
+
     return { text: lines.join('\n'), lang };
   }
 

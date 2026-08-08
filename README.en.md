@@ -21,6 +21,9 @@ No `yt-dlp`, no third‑party sites or servers: everything runs locally in your 
   otherwise impossible: frames between keyframes are stored as differences and cannot be
   decoded on their own.
 - **Subtitles** — `.txt` without timecodes. Prefers Russian, otherwise any available language.
+  Both transcript panels are supported: the classic one (which lets the language be picked)
+  and YouTube's newer "In this video" panel — that one offers no language control, so
+  whatever it displays is what gets saved.
 - **Video format** — "Fast" (VP9 in mp4, no re‑encoding, seconds) or "H.264" (re‑encode for
   compatibility with older players, slow).
 - **Auto‑disables Autoplay** — the extension turns off YouTube's "Autoplay next" so the next
