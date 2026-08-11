@@ -109,7 +109,9 @@
     if (isMp3) {
       runs.push({
         name: 'mp3', out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3',
-        args: [...inA(seek), ...limit, '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'],
+        // 320 kbps CBR — the highest quality libmp3lame offers; a 320k MP3 stays
+        // compatible everywhere (mp3 is an MPEG-1 Layer 3 container, not VBR-fragile).
+        args: [...inA(seek), ...limit, '-vn', '-c:a', 'libmp3lame', '-b:a', '320k', 'out.mp3'],
       });
     } else if (transcode) {
       // Re-encode to H.264 + AAC. An automatic exact cut of a short clip favours speed
