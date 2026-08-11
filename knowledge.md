@@ -130,6 +130,13 @@ All code lives in `extension/`. The extension is split into three contexts commu
   reset re-inits the SourceBuffer and CUTS the track). The honest toasts ("плеер отдал Np
   вместо Mp", "файл обрезан") are the correct detection signal — ask the user to disable
   such extensions when high-res captures keep downgrading despite a working menu selection.
+- **Slow captures on ONE video ≠ a code bug (confirmed live)**: after many full
+  downloads of the same video, YouTube can deprioritize its segment delivery for that
+  video/IP — capture speed is bound by how fast the player's buffer fills, so the same
+  code that downloads other videos fast will crawl on that one. Verify with a control
+  video (a fresh, never-downloaded clip at the same resolution) before chasing the code;
+  the refactor/cleanup commits were proven behavior-identical (byte-level) while a single
+  re-downloaded video got slow. Usually temporary — the download works, just slower.
 - **User must run an ad blocker (uBlock Origin)** — without it YouTube injects ad breaks into
   the media stream and capture fails. This is stated in the README as a hard requirement.
 - **Never retry `ytdl-finalize`** — a repeated finalize re-runs ffmpeg on already-freed data.
