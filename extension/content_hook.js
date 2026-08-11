@@ -176,25 +176,65 @@
   // setPlaybackQualityRange call is often ignored), so we verify with videoHeight and
   // keep re-applying the quality until it sticks.
   const RES_H = { hd2160: 2000, hd1440: 1300, hd1080: 1000, hd720: 700, medium: 300, small: 200, tiny: 100 };
+  // Actual resolution height per quality key — what the native menu labels items with
+  // ("1440p"/"2160p"). menuSetQuality matches menu text against THIS, not RES_H (a
+  // verification threshold).
+  const RES_NAME = { hd2160: 2160, hd1440: 1440, hd1080: 1080, hd720: 720, medium: 360, small: 240, tiny: 144 };
   function servedHeight() { try { return video().videoHeight || 0; } catch (e) { return 0; } }
 
-  // YouTube caps the served resolution by the rendered player size (viewport cap).
-  // Widening the player via theater mode lifts that cap for high-res captures.
-  function theaterState() {
+  // Force the quality the way the user does it: through the native settings menu. The JS
+  // quality API (setPlaybackQualityRange) is unreliable in the SABR player and can keep
+  // silently serving 720p, but the menu path always works. Best-effort: returns true when
+  // the target was selected, false when the menu wasn't reachable. NO state toggles here —
+  // we only ever open the menu, pick a quality, and close it (the user's layout is left
+  // exactly as it was).
+  function menuItemLabel(it) {
     try {
-      const b = document.querySelector('.ytp-size-button');
-      return b ? b.getAttribute('aria-pressed') === 'true' : null;
-    } catch (e) { return null; }
+      const l = it.querySelector('.ytp-menuitem-label') || it.querySelector('.ytp-menuitem-title') || it;
+      return (l.textContent || '').trim();
+    } catch (e) { return ''; }
   }
-  function setTheater(on) {
+  async function menuSetQuality(wantH) {
+    const gear = document.querySelector('.ytp-settings-button');
+    if (!gear) return false;
+    const isOpen = () => {
+      try {
+        const m = document.querySelector('.ytp-settings-menu');
+        return !!(m && (m.offsetParent !== null || m.getClientRects().length));
+      } catch (e) { return false; }
+    };
+    // Only VISIBLE items: hidden submenu panels stay in the DOM, and clicking a hidden
+    // item is a no-op. getClientRects() returns nothing for display:none/hidden elements.
+    const items = () => [...document.querySelectorAll('.ytp-settings-menu .ytp-menuitem')]
+      .filter(it => { try { return it.getClientRects().length > 0; } catch (e) { return false; } });
+    // The user's player UI must be left exactly as it was, so EVERY exit path — including
+    // failures — closes the settings menu instead of leaving it open over the player.
+    const closeIfOpen = () => { try { if (isOpen()) gear.click(); } catch (e) {} };
     try {
-      const wf = document.querySelector('ytd-watch-flexy');
-      if (wf && wf.setTheaterModeRequested) { wf.setTheaterModeRequested(on); return; }
-    } catch (e) {}
-    try {
-      const b = document.querySelector('.ytp-size-button');
-      if (b && (b.getAttribute('aria-pressed') === 'true') !== !!on) b.click();
-    } catch (e) {}
+      if (isOpen()) { gear.click(); await sleep(250); }
+      gear.click(); // open the settings menu
+      for (let i = 0; i < 20 && !items().length; i++) await sleep(150);
+      const qItem = items().find(it => /качеств|quality/i.test(menuItemLabel(it)));
+      if (!qItem) { closeIfOpen(); return false; }
+      qItem.click();
+      let qItems = [];
+      for (let i = 0; i < 25; i++) {
+        qItems = items().filter(it => /^\d{3,4}p/i.test(menuItemLabel(it)));
+        if (qItems.length) break;
+        await sleep(150);
+      }
+      if (!qItems.length) { closeIfOpen(); return false; }
+      // Prefer the exact "1440p" entry over "1440p60"; accept any variant that starts
+      // with the target height (labels normalize to digits: "1440p60" → "144060").
+      const norm = (t) => String(t).replace(/[^0-9]/g, '');
+      const target = qItems.filter(it => norm(menuItemLabel(it)) === String(wantH))[0]
+                  || qItems.filter(it => norm(menuItemLabel(it)).startsWith(String(wantH)))[0];
+      if (!target) { closeIfOpen(); return false; }
+      target.click();
+      await sleep(250);
+      closeIfOpen(); // the menu may auto-close on selection; close it if it didn't
+      return true;
+    } catch (e) { closeIfOpen(); return false; }
   }
   // Seek via the player API, which also updates YouTube's app-level streaming
   // position — plain v.currentTime only moves the element, so the player would
@@ -241,13 +281,12 @@
     const capId = vidId();
     // Resolution verification only matters for high-res targets (hd1440/hd2160), where
     // the ABR player can silently serve less; 720p/1080p/mp3 reliably get what is asked.
-    const wantH = RES_H[targetQ] || 0;
-    const highRes = wantH > 700;
+    const wantH = RES_H[targetQ] || 0;       // verification threshold for the videoHeight poll
+    const wantRes = RES_NAME[targetQ] || 0;  // menu label height — what menuSetQuality must match
+    const highRes = wantRes >= 1440;         // only 1440p/2160p need the menu dance
 
     const prev = { paused: v.paused, rate: v.playbackRate, time: v.currentTime, muted: v.muted };
-    const prevTheater = theaterState();
     keepAutoplayOff();
-    if (prevTheater === false && highRes) setTheater(true); // lift the viewport resolution cap
     try { v.muted = true; } catch (e) {}
     try { v.pause(); } catch (e) {}
 
@@ -263,9 +302,15 @@
     await sleep(500);
     seekVia(preSeek);
     await sleep(700);
+
+    // Force the requested quality. The JS API is unreliable for high-res (it can keep
+    // serving 720p), so select via the native settings menu — the same path a user clicks
+    // manually — and keep the API call as belt-and-braces. No player layout is changed.
+    const menuOk = highRes ? await menuSetQuality(wantRes) : false;
+    setQualityRaw(targetQ);
+
     resetTracks();
     store.capturing = true;
-    setQualityRaw(targetQ);
     seekVia(capStart);
     await sleep(500);
 
@@ -275,7 +320,12 @@
     // (quality switch), appendBuffer restarts the track (see re-init handling), so any
     // low-res lead-in is discarded automatically.
     const haveInits = () => store.tracks.audio && (!needVideo || store.tracks.video);
-    for (let i = 0; i < 80; i++) {
+    // When the native menu couldn't be driven (menuOk false), the JS API alone rarely
+    // lifts the resolution, so don't burn the full 16 s polling videoHeight — a short
+    // re-apply window still covers the rare case where the API IS honoured, and the
+    // honest actualH report remains the safety net.
+    const waitIter = highRes && menuOk ? 80 : 20;
+    for (let i = 0; i < waitIter; i++) {
       if (haveInits() && (!highRes || servedHeight() >= wantH)) break;
       if (i % 2 === 0) setQualityRaw(targetQ);
       await sleep(200);
@@ -342,7 +392,6 @@
       seekVia(prev.time);
       try { v.muted = prev.muted; } catch (e) {}
       keepAutoplayOff(); // leave autoplay disabled — don't turn it back on
-      if (typeof prevTheater === 'boolean' && theaterState() !== prevTheater) setTheater(prevTheater);
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
     onProgress(1);

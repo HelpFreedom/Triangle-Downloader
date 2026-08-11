@@ -86,11 +86,15 @@ All code lives in `extension/`. The extension is split into three contexts commu
   fragments are stream-copied and start at the keyframe *before* the requested point (a note is
   shown in the toast). The copy path always uses `-avoid_negative_ts make_zero`.
 - **Resolution verification**: the modern ABR player can silently serve a lower resolution
-  even when `setPlaybackQualityRange('hd2160','hd2160')` is called. `playthrough()` re-applies
-  the quality while polling `video.videoHeight` against `RES_H` thresholds (up to ~16 s), and
-  temporarily enables theater mode (`setTheater`) to lift YouTube's viewport-size resolution
-  cap. The download reply carries the actually-served `height`; `content_ui.js` names the file
-  after the real resolution and toasts "плеер отдал Np вместо Mp" when downgraded.
+  even when `setPlaybackQualityRange('hd2160','hd2160')` is called. For high-res targets
+  (`RES_H[target] > 700`, i.e. 1440p/2160p) `playthrough()` selects the quality through the
+  **native settings menu** (`menuSetQuality` — opens the gear, picks the exact "Np" entry,
+  closes it; the same path the user clicks manually, which the user confirmed works), then keeps
+  re-applying the JS quality API while polling `video.videoHeight` against `RES_H` thresholds
+  (up to ~16 s). NO player layout is touched (no theater mode — `setTheaterModeRequested`
+  toggles instead of setting, and it broke the user's wide layout). The download reply carries
+  the actually-served `height`; `content_ui.js` names the file after the real resolution and
+  toasts "плеер отдал Np вместо Mp" when downgraded.
 - **User must run an ad blocker (uBlock Origin)** — without it YouTube injects ad breaks into
   the media stream and capture fails. This is stated in the README as a hard requirement.
 - **Never retry `ytdl-finalize`** — a repeated finalize re-runs ffmpeg on already-freed data.
