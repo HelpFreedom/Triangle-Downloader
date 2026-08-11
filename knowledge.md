@@ -114,6 +114,14 @@ All code lives in `extension/`. The extension is split into three contexts commu
 - **Mid-capture re-init CUTS the track**: a fresh init while recording replaces that track
   (`store.restarts` counter, counted only when the track already had data). Any restart ⇒
   `complete:false`, so the UI warns "во время захвата переключилось качество".
+- **Conflicting extensions can force-reset the quality (known external cause, confirmed
+  live)**: "YouTube Auto HD + FPS" and similar quality-forcing extensions keep calling the
+  player's quality API, switching it back to AUTO/range mode and OVERRIDING our native-menu
+  selection mid-capture. Symptoms: `[YTDL] quality {menuOk: true, after: 'hd1440'}` but the
+  capture logs `servedH: 720` and `complete: false` with `restarts` climbing (every external
+  reset re-inits the SourceBuffer and CUTS the track). The honest toasts ("плеер отдал Np
+  вместо Mp", "файл обрезан") are the correct detection signal — ask the user to disable
+  such extensions when high-res captures keep downgrading despite a working menu selection.
 - **User must run an ad blocker (uBlock Origin)** — without it YouTube injects ad breaks into
   the media stream and capture fails. This is stated in the README as a hard requirement.
 - **Never retry `ytdl-finalize`** — a repeated finalize re-runs ffmpeg on already-freed data.
