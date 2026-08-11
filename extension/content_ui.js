@@ -22,6 +22,14 @@
       window.postMessage(Object.assign({ __ytdl_to_hook: true, cmd, reqId }, extra || {}), '*');
     });
   }
+  // Reject if the hook never answers (e.g. it failed to install) instead of leaving
+  // the menu hanging forever with no feedback.
+  function withTimeout(p, ms, message) {
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error(message)), ms);
+      p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+    });
+  }
   // download drives streaming progress + a final result
   function download(params, onProgress) {
     return new Promise((resolve, reject) => {
@@ -101,18 +109,44 @@
 
   function head(text) { const d = document.createElement('div'); d.className = 'ytdl-menu-head'; d.textContent = text; return d; }
 
+  // Rough VP9 bitrate estimates (Mbps) used ONLY to warn before a big capture. Real
+  // bitrate varies, so the estimate is conservative (high side). It matters most for
+  // 1440p/2160p: the offscreen document holds the whole track in RAM several times
+  // over, so a multi-GB source can make the tab very heavy or get it killed.
+  const EST_MBPS = { 2160: 25, 1440: 12, 1080: 6, 720: 4 };
+  const BIG_CAPTURE_MB = 400;
+  function warnBigCapture(height, seconds) {
+    const mb = ((EST_MBPS[height] || 6) * Math.max(0, seconds)) / 8;
+    if (mb <= BIG_CAPTURE_MB) return true;
+    return window.confirm('Будет загружено примерно ' + Math.round(mb) +
+      ' МБ. При муксинге память используется в несколько раз больше — на больших ' +
+      'файлах возможна тяжёлая нагрузка на вкладку. Для больших видео лучше скачивать ' +
+      'фрагменты. Продолжить?');
+  }
+
   async function onClick(e) {
     e.stopPropagation();
     if (menuEl) { closeMenu(); return; }
-    const info = await callHook('info');
+    let info;
+    try {
+      info = await withTimeout(callHook('info'), 4000, 'не удалось связаться с плеером');
+    } catch (err) {
+      const t = toast();
+      t.set('Ошибка: ' + (err.message || err), 1);
+      t.hide(5000);
+      return;
+    }
     const duration = Math.floor(info.duration || 0);
-    // 1440p/2160p appear only when the player reports them; 1080p/720p stay
-    // always-visible best-effort options (legacy behaviour).
+    // Show only the qualities the player actually reports as available — a missing
+    // option means the video can't be captured at it, and a falsely-labelled file
+    // (e.g. "[720p]" containing 360p) is worse than no option at all.
     const heights = (info.heights || []).filter((h) => h === 2160 || h === 1440 || h === 1080 || h === 720);
-    if (!heights.includes(1080)) heights.unshift(1080);
-    if (!heights.includes(720)) heights.push(720);
     const uniq = [...new Set(heights)].sort((a, b) => b - a);
     const { transcode = false } = await chrome.storage.local.get('transcode');
+    // Radio state lives here (onClick scope) so the video/mp3 click handlers read the
+    // CURRENT selection — passing the initial storage value would ignore a toggle made
+    // in this menu session.
+    let current = !!transcode;
 
     menuEl = document.createElement('div');
     menuEl.className = 'ytdl-menu';
@@ -142,17 +176,20 @@
       return { start, end };
     }
 
-    // --- video ---
-    menuEl.appendChild(head('Видео'));
-    uniq.forEach((h) => {
-      const item = el('div', 'ytdl-menu-item');
-      itemLabel(item, h + 'p', 'mp4');
-      item.addEventListener('click', () => {
-        const f = fragment(); closeMenu();
-        startDownload({ format: 'mp4', height: h, start: f.start, end: f.end }, info);
+    // --- video (only when at least one quality is available) ---
+    if (uniq.length) {
+      menuEl.appendChild(head('Видео'));
+      uniq.forEach((h) => {
+        const item = el('div', 'ytdl-menu-item');
+        itemLabel(item, h + 'p', 'mp4');
+        item.addEventListener('click', () => {
+          const f = fragment(); closeMenu();
+          if (!warnBigCapture(h, f.end - f.start)) return;
+          startDownload({ format: 'mp4', height: h, start: f.start, end: f.end }, info, current);
+        });
+        menuEl.appendChild(item);
       });
-      menuEl.appendChild(item);
-    });
+    }
 
     // --- audio ---
     menuEl.appendChild(head('Аудио'));
@@ -160,7 +197,7 @@
     itemLabel(mp3, 'MP3', 'аудио');
     mp3.addEventListener('click', () => {
       const f = fragment(); closeMenu();
-      startDownload({ format: 'mp3', height: null, start: f.start, end: f.end }, info);
+      startDownload({ format: 'mp3', height: null, start: f.start, end: f.end }, info, current);
     });
     menuEl.appendChild(mp3);
 
@@ -171,30 +208,31 @@
     subs.addEventListener('click', () => { closeMenu(); downloadSubtitles(info); });
     menuEl.appendChild(subs);
 
-    // --- video format toggle ---
-    menuEl.appendChild(head('Формат видео'));
-    const formats = [
-      { key: false, title: 'Быстро', sub: 'VP9 в mp4, без перекодирования' },
-      { key: true, title: 'H.264 (совместимо)', sub: 'перекодирование, медленно' },
-    ];
-    let current = !!transcode;
-    const rows = [];
-    formats.forEach((f) => {
-      const row = el('div', 'ytdl-menu-radio' + (current === f.key ? ' sel' : ''));
-      row.appendChild(el('span', 'ytdl-dot'));
-      const txt = el('span', 'ytdl-radio-txt');
-      txt.appendChild(el('b', null, f.title));
-      txt.appendChild(el('i', null, f.sub));
-      row.appendChild(txt);
-      row.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        current = f.key;
-        chrome.storage.local.set({ transcode: f.key });
-        rows.forEach((r, i) => r.classList.toggle('sel', formats[i].key === current));
+    // --- video format toggle (only meaningful when video options exist) ---
+    if (uniq.length) {
+      menuEl.appendChild(head('Формат видео'));
+      const formats = [
+        { key: false, title: 'Быстро', sub: 'VP9 в mp4, без перекодирования' },
+        { key: true, title: 'H.264 (совместимо)', sub: 'перекодирование, медленно' },
+      ];
+      const rows = [];
+      formats.forEach((f) => {
+        const row = el('div', 'ytdl-menu-radio' + (current === f.key ? ' sel' : ''));
+        row.appendChild(el('span', 'ytdl-dot'));
+        const txt = el('span', 'ytdl-radio-txt');
+        txt.appendChild(el('b', null, f.title));
+        txt.appendChild(el('i', null, f.sub));
+        row.appendChild(txt);
+        row.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          current = f.key;
+          chrome.storage.local.set({ transcode: f.key });
+          rows.forEach((r, i) => r.classList.toggle('sel', formats[i].key === current));
+        });
+        rows.push(row);
+        menuEl.appendChild(row);
       });
-      rows.push(row);
-      menuEl.appendChild(row);
-    });
+    }
 
     document.body.appendChild(menuEl);
     const b = document.getElementById(BTN_ID).getBoundingClientRect();
@@ -251,15 +289,13 @@
     }
   }
 
-  async function startDownload(opts, info) {
+  async function startDownload(opts, info, transcode) {
     const { format, height, start, end } = opts;
     const duration = Math.floor(info.duration || 0);
     const isMp3 = format === 'mp3';
     const label = isMp3 ? 'MP3' : height + 'p';
     const t = toast();
     t.set('Готовлю ' + label + ' — загрузка сегментов…', 0.02);
-
-    const { transcode = false } = await chrome.storage.local.get('transcode');
 
     const onProg = (msg) => {
       if (msg && msg.t === 'ytdl-progress') {
@@ -313,9 +349,10 @@
       });
 
       if (!res || !res.ok) throw new Error(res && res.error || 'mux failed');
+      const partialNote = result.complete === false ? ' — захват неполный, файл может быть обрезан' : '';
       t.set('Готово: ' + (res.filename || filename) +
-        (alignedStart ? ' — начало выровнено по опорному кадру' : ''), 1);
-      t.hide(alignedStart ? 7000 : 4000);
+        (alignedStart ? ' — начало выровнено по опорному кадру' : '') + partialNote, 1);
+      t.hide(alignedStart || partialNote ? 7000 : 4000);
     } catch (err) {
       t.set('Ошибка: ' + (err.message || err), 1);
       t.hide(6000);

@@ -28,6 +28,10 @@ async function getFF() {
     ff = inst;
     return inst;
   })();
+  // On failure, forget the rejected promise so the NEXT download retries instead of
+  // being stuck with a permanently-rejected ffLoading (which would brick all muxing
+  // until the extension is reloaded). The current caller still receives the error.
+  ffLoading = ffLoading.catch((err) => { ffLoading = null; throw err; });
   return ffLoading;
 }
 
@@ -144,7 +148,7 @@ async function finalize() {
       try {
         const out = await inst.readFile(run.out);
         // a non-empty result only — a "successful" run can still yield an empty file
-        if (out && out.length > 1024) { data = out; chosen = run; break; }
+        if (out && out.length > 0) { data = out; chosen = run; break; }
         failures.push(run.name + ': пустой результат');
       } catch (e) { failures.push(run.name + ': файл не создан'); }
     } else {
@@ -165,8 +169,12 @@ async function finalize() {
   const blob = new Blob([data.buffer], { type: chosen.type });
   const url = URL.createObjectURL(blob);
   const res = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename });
-  // keep the blob alive briefly so chrome.downloads can read it, then release
-  setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
+  // The blob is revoked by the background once the download actually completes
+  // (ytdl-revoke). Belt-and-braces: if the service worker is terminated before the
+  // download finishes, its listener and fallback timer are lost — this document timer
+  // always runs and guarantees the blob is eventually released. Double revocation is
+  // harmless (revoking an already-revoked URL is a no-op).
+  setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 10 * 60 * 1000);
   return res && res.ok ? { ok: true, filename } : { ok: false, error: (res && res.error) || 'save failed' };
 }
 
@@ -177,6 +185,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // service worker resolves createDocument() and only this listener proves the document
   // is actually able to receive.
   if (msg.t === 'ytdl-ping') { sendResponse({ ok: true }); return; }
+
+  if (msg.t === 'ytdl-revoke') {
+    // background tells us the download finished (or failed) and the blob is no longer
+    // being read — safe to release the object URL now.
+    try { URL.revokeObjectURL(msg.url); } catch (e) {}
+    sendResponse({ ok: true });
+    return; // sync
+  }
 
   if (msg.t === 'ytdl-begin') {
     acc.video = []; acc.audio = []; acc.seq = 0;

@@ -96,17 +96,21 @@
           // Always remember the latest init (ungated) — it usually only arrives at load.
           if (init) store.lastInit[kind] = { bytes: u8.slice(), mime: this.__ytdlMime || '' };
           if (store.capturing) {
-            let t = store.tracks[kind];
-            if (!t) {
-              if (init) {
-                t = store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [u8.slice()] };
+            if (init) {
+              // A fresh init mid-capture means the player cleared its buffer and
+              // restarted (remove() + new init). Everything before is no longer
+              // contiguous, so start the track over at the new init instead of
+              // gluing two init segments together (which would corrupt the file).
+              store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [u8.slice()] };
+            } else {
+              const t = store.tracks[kind];
+              if (t) {
+                t.parts.push(u8.slice());
               } else if (store.lastInit[kind]) {
                 // media arrived without a fresh init → seed the track with the stored init
-                t = store.tracks[kind] = { mime: store.lastInit[kind].mime, parts: [store.lastInit[kind].bytes, u8.slice()] };
+                store.tracks[kind] = { mime: store.lastInit[kind].mime, parts: [store.lastInit[kind].bytes, u8.slice()] };
               }
               // else: no init available yet — skip until one appears
-            } else {
-              t.parts.push(u8.slice());
             }
           }
         }
@@ -122,6 +126,19 @@
     const out = new Uint8Array(n);
     let o = 0; for (const p of t.parts) { out.set(p, o); o += p.length; }
     return { bytes: out, mime: t.mime };
+  }
+
+  // Total captured bytes across both tracks — a memory safety valve so a forged or
+  // pathological capture can't make the page (and its offscreen copy) accumulate
+  // unbounded data. Breaking on this leaves `complete` false, which the UI surfaces.
+  const BYTE_CAP = 4 * 1024 * 1024 * 1024; // ~4 GB
+  function totalCaptured() {
+    let n = 0;
+    for (const kind of ['video', 'audio']) {
+      const t = store.tracks[kind];
+      if (t) for (const p of t.parts) n += p.length;
+    }
+    return n;
   }
 
   // ---- player helpers ------------------------------------------------------
@@ -237,6 +254,7 @@
     };
     let capturedFrom = capStart;
     let cursor = capStart, stall = 0;
+    let complete = false;
     const span = Math.max(0.1, capEnd - capStart);
     const started = Date.now();
     try {
@@ -249,7 +267,8 @@
 
         const edge = bufferedEndAt(cursor);
         onProgress(Math.min(0.99, Math.max(0, edge - capStart) / span));
-        if (edge >= capEnd - 0.6) break;                 // range fully buffered → captured
+        if (edge >= capEnd - 0.6) { complete = true; break; } // range fully buffered → captured
+        if (totalCaptured() > BYTE_CAP) break;          // memory safety valve → incomplete
 
         if (edge > cursor + 0.3) {                       // window extended → hop to the edge
           cursor = edge;
@@ -273,7 +292,7 @@
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
     onProgress(1);
-    return { capturedFrom: Math.max(0, capturedFrom) };
+    return { capturedFrom: Math.max(0, capturedFrom), complete };
   }
 
   // ---- subtitles (read from the built-in transcript panel) -----------------
@@ -460,19 +479,27 @@
           heights: availableHeights(),
         });
       } else if (cmd === 'download') {
+        // Any page script can forge bridge messages, so keep malformed input out of
+        // the seek math and refuse nested captures (which would fight over the same
+        // player and tracks). playthrough itself clamps to the video's duration;
+        // here we only ensure the numbers are real.
+        if (store.capturing) throw new Error('уже идёт захват — дождитесь завершения');
         const isMp3 = format === 'mp3';
+        const s = Number(start), e = Number(end);
+        if (!Number.isFinite(s) || !Number.isFinite(e)) throw new Error('неверный диапазон');
         // mp3 only needs audio → capture at a low but still-adaptive video quality
         // (360p) to save bandwidth while keeping video/audio as separate tracks.
         const targetQ = isMp3 ? 'medium' : (Q[height] || 'hd720');
         const preQ = (targetQ === 'small' || targetQ === 'tiny' || targetQ === 'medium') ? 'tiny' : 'medium';
         const cap = await playthrough(
-          { targetQ, preQ, start, end, needVideo: !isMp3 },
+          { targetQ, preQ, start: s, end: e, needVideo: !isMp3 },
           (pct) => reply({ progress: pct, phase: 'buffering' }));
 
         const aud = assemble('audio');
         if (!aud) throw new Error('не удалось захватить аудио');
         const payload = {
           ok: true, done: true,
+          complete: !!cap.complete,         // false when capture broke (stall/cap) — file may be cut
           capturedFrom: cap.capturedFrom,   // where the captured file actually begins
           audio: { mime: aud.mime, size: aud.bytes.byteLength },
         };
