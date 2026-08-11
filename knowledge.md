@@ -136,7 +136,8 @@ All code lives in `extension/`. The extension is split into three contexts commu
   code that downloads other videos fast will crawl on that one. Verify with a control
   video (a fresh, never-downloaded clip at the same resolution) before chasing the code;
   the refactor/cleanup commits were proven behavior-identical (byte-level) while a single
-  re-downloaded video got slow. Usually temporary — the download works, just slower.
+  re-downloaded video got slow. Confirmed fully recoverable: after a pause, the same video
+  downloaded at normal speed again — wait it out rather than debugging the code.
 - **User must run an ad blocker (uBlock Origin)** — without it YouTube injects ad breaks into
   the media stream and capture fails. This is stated in the README as a hard requirement.
 - **Never retry `ytdl-finalize`** — a repeated finalize re-runs ffmpeg on already-freed data.
