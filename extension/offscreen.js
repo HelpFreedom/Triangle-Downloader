@@ -65,7 +65,7 @@ async function finalize() {
   // math live in lib/format.js (buildRuns) — it is unit-tested and identical in prod.
   const runs = L.buildRuns({
     isMp3, transcode: acc.transcode, quickEncode: acc.quickEncode,
-    trimStart, trimDuration, vName, aName,
+    trimStart, trimDuration, vName, aName, mp3Bitrate: acc.mp3Bitrate,
   });
 
   let data = null, chosen = null;
@@ -132,6 +132,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     acc.transcode = !!msg.transcode;
     acc.format = msg.format || 'mp4';
     acc.quickEncode = !!msg.quickEncode;
+    acc.mp3Bitrate = Number(msg.mp3Bitrate) || 192; // kbps, default matches the original
     acc.trimStart = msg.trimStart || 0;
     acc.trimDuration = msg.trimDuration || 0;
     // warm up ffmpeg while chunks stream in

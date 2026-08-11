@@ -192,12 +192,14 @@
     // (e.g. "[720p]" containing 360p) is worse than no option at all.
     const heights = (info.heights || []).filter((h) => h === 2160 || h === 1440 || h === 1080 || h === 720);
     const uniq = [...new Set(heights)].sort((a, b) => b - a);
-    const { transcode = false, parts = false } = await chrome.storage.local.get(['transcode', 'parts']);
+    const { transcode = false, parts = false, mp3Bitrate = 192 } =
+      await chrome.storage.local.get(['transcode', 'parts', 'mp3Bitrate']);
     // Radio/toggle state lives here (onClick scope) so the video/mp3 click handlers read
     // the CURRENT selection — passing the initial storage value would ignore a change made
     // in this menu session.
     let current = !!transcode;
-    let partsOn = !!parts; // «По частям» toggle — read at click time
+    let partsOn = !!parts;    // «По частям» toggle — read at click time
+    let mp3Bit = Number(mp3Bitrate) || 192; // kbps — only affects MP3 downloads
 
     menuEl = document.createElement('div');
     menuEl.className = 'ytdl-menu';
@@ -261,10 +263,10 @@
       const range = f.end - f.start;
       // mp3 is tiny memory-wise; the toggle only matters to stay under the capture time cap.
       if (partsOn && range > PART_MAX_SEC) {
-        startParts({ format: 'mp3', height: null }, info, current, L.splitRange(f.start, f.end, PART_MAX_SEC));
+        startParts({ format: 'mp3', height: null, mp3Bitrate: mp3Bit }, info, current, L.splitRange(f.start, f.end, PART_MAX_SEC));
         return;
       }
-      startDownload({ format: 'mp3', height: null, start: f.start, end: f.end }, info, current);
+      startDownload({ format: 'mp3', height: null, start: f.start, end: f.end, mp3Bitrate: mp3Bit }, info, current);
     });
     menuEl.appendChild(mp3);
 
@@ -314,6 +316,30 @@
       });
       menuEl.appendChild(partsRow);
     }
+
+    // --- MP3 bitrate: only affects MP3 downloads; default 192k matches the original ---
+    menuEl.appendChild(head('MP3 битрейт'));
+    const bitrates = [
+      { key: 192, title: '192 kbps', sub: 'как в оригинале' },
+      { key: 320, title: '320 kbps', sub: 'максимальное качество, файл больше' },
+    ];
+    const bitRows = [];
+    bitrates.forEach((b) => {
+      const row = el('div', 'ytdl-menu-radio' + (mp3Bit === b.key ? ' sel' : ''));
+      row.appendChild(el('span', 'ytdl-dot'));
+      const txt = el('span', 'ytdl-radio-txt');
+      txt.appendChild(el('b', null, b.title));
+      txt.appendChild(el('i', null, b.sub));
+      row.appendChild(txt);
+      row.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        mp3Bit = b.key;
+        chrome.storage.local.set({ mp3Bitrate: b.key });
+        bitRows.forEach((r, i) => r.classList.toggle('sel', bitrates[i].key === mp3Bit));
+      });
+      bitRows.push(row);
+      menuEl.appendChild(row);
+    });
 
     document.body.appendChild(menuEl);
     const b = document.getElementById(BTN_ID).getBoundingClientRect();
@@ -373,7 +399,7 @@
   // Shows per-step progress in `t` prefixed with `prefix` (e.g. "Часть 2 из 4: ") and
   // returns { ok } / { ok: false, error } instead of raising.
   async function downloadOne(opts, info, transcode, t, prefix) {
-    const { format, height, start, end } = opts;
+    const { format, height, start, end, mp3Bitrate } = opts;
     const duration = Math.floor(info.duration || 0);
     const isMp3 = format === 'mp3';
     const label = isMp3 ? 'MP3' : height + 'p';
@@ -422,6 +448,7 @@
         trimStart,
         // only limit duration when a real fragment was requested
         trimDuration: isFragment ? trimDuration : 0,
+        mp3Bitrate,
       });
 
       if (!res || !res.ok) throw new Error(res && res.error || 'mux failed');
@@ -447,7 +474,7 @@
 
   // Save a long range as sequential parts — one independent file per part.
   async function startParts(base, info, transcode, parts) {
-    const { format, height } = base;
+    const { format, height, mp3Bitrate } = base;
     const label = format === 'mp3' ? 'MP3' : height + 'p';
     const t = toast();
     t.set('Скачивание по частям: 0 из ' + parts.length + '…', 0.02);
@@ -459,6 +486,7 @@
       t.set('Часть ' + (i + 1) + ' из ' + parts.length + ': готовлю ' + label + '…', 0.02);
       const r = await downloadOne({
         format, height, start: p.start, end: p.end,
+        mp3Bitrate,
         partLabel: ' (part ' + (i + 1) + ' of ' + parts.length + ')',
       }, info, transcode, t, 'Часть ' + (i + 1) + ' из ' + parts.length + ': ');
       if (!r.ok) { failed = { index: i + 1, error: r.error }; break; }
@@ -525,6 +553,7 @@
       videoMime: job.videoMime, audioMime: job.audioMime,
       transcode: !!job.transcode, quickEncode: !!job.quickEncode,
       trimStart: job.trimStart || 0, trimDuration: job.trimDuration || 0,
+      mp3Bitrate: job.mp3Bitrate, // default (192) is owned by the offscreen side
     });
 
     let seq = 0; // lets the receiver drop a repeated chunk instead of doubling the data

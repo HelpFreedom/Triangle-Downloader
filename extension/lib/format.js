@@ -95,7 +95,7 @@
   // start mid-GOP, so it never seeks and just limits the length (both tracks start
   // together at the keyframe before the request). MP4 gets an edit-list-free copy with
   // normalized timestamps so players don't show a frozen tail.
-  function buildRuns({ isMp3, transcode, quickEncode, trimStart, trimDuration, vName, aName }) {
+  function buildRuns({ isMp3, transcode, quickEncode, trimStart, trimDuration, vName, aName, mp3Bitrate }) {
     const exact = !!transcode;
     const seek = exact && trimStart > 0.05 ? ['-ss', trimStart.toFixed(3)] : [];
     const limit = trimDuration > 0.05
@@ -107,11 +107,12 @@
 
     const runs = [];
     if (isMp3) {
+      // CBR via -b:a. Defaults to the author's original 192k; the menu can pick 320k
+      // (max for libmp3lame) — a user preference, never a hardcoded change.
+      const bitrate = mp3Bitrate ? String(mp3Bitrate).replace(/k$/i, '') + 'k' : '192k';
       runs.push({
         name: 'mp3', out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3',
-        // 320 kbps CBR — the highest quality libmp3lame offers; a 320k MP3 stays
-        // compatible everywhere (mp3 is an MPEG-1 Layer 3 container, not VBR-fragile).
-        args: [...inA(seek), ...limit, '-vn', '-c:a', 'libmp3lame', '-b:a', '320k', 'out.mp3'],
+        args: [...inA(seek), ...limit, '-vn', '-c:a', 'libmp3lame', '-b:a', bitrate, 'out.mp3'],
       });
     } else if (transcode) {
       // Re-encode to H.264 + AAC. An automatic exact cut of a short clip favours speed

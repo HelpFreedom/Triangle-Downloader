@@ -12,7 +12,7 @@ No `yt-dlp`, no third‑party sites or servers: everything runs locally in your 
 
 - **Video** — 720p / 1080p / 1440p / 2160p as `.mp4` (video + audio; 1440p and 2160p are
   shown only when the video actually supports them).
-- **Audio** — `.mp3` (audio track only, 320 kbps).
+- **Audio** — `.mp3` (audio track only; bitrate 192/320 kbps, selectable).
 - **Clip selection** — "start — end" fields in the menu (default `0:00:00` … full length).
   **Only the selected range is fetched**, not the whole video: e.g. 10 seconds out of an
   hour-long video download in a couple of seconds.

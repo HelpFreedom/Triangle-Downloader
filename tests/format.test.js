@@ -126,6 +126,17 @@ test('buildRuns: mp3 → single mp3 run', () => {
   assert.ok(runs[0].args.includes('libmp3lame'));
 });
 
+test('buildRuns: mp3 defaults to 192k and honours the menu bitrate', () => {
+  const def = L.buildRuns({ isMp3: true, transcode: false, quickEncode: false, trimStart: 0, trimDuration: 0, vName: null, aName: 'a.webm' });
+  assert.ok(def[0].args.includes('192k'), 'default stays the original 192k');
+  assert.ok(!def[0].args.includes('320k'));
+  const hi = L.buildRuns({ isMp3: true, transcode: false, quickEncode: false, trimStart: 0, trimDuration: 0, vName: null, aName: 'a.webm', mp3Bitrate: 320 });
+  assert.ok(hi[0].args.includes('320k'), 'menu selection of 320 is honoured');
+  // '320k' string input also normalises to '320k'
+  const str = L.buildRuns({ isMp3: true, transcode: false, quickEncode: false, trimStart: 0, trimDuration: 0, vName: null, aName: 'a.webm', mp3Bitrate: '320k' });
+  assert.ok(str[0].args.includes('320k'));
+});
+
 test('buildRuns: transcode → single h264 run; quickEncode picks ultrafast', () => {
   const plain = L.buildRuns({ isMp3: false, transcode: true, quickEncode: false, trimStart: 0, trimDuration: 0, vName: 'v.webm', aName: 'a.webm' });
   assert.equal(plain.length, 1);
