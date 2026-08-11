@@ -26,6 +26,8 @@
     // does NOT re-init audio) — so we remember them and seed a track that starts
     // receiving media mid-capture without a fresh init of its own.
     lastInit: Object.create(null), // kind -> { bytes: Uint8Array, mime: string }
+    sb: Object.create(null),       // kind -> latest SourceBuffer (for per-track buffered edges)
+    restarts: Object.create(null), // kind -> mid-capture re-init count (track was CUT)
   };
 
   function vidId() { try { return new URLSearchParams(location.search).get('v'); } catch (e) { return null; } }
@@ -81,6 +83,11 @@
     try {
       sb.__ytdlMime = mime;
       sb.__ytdlKind = /audio/i.test(mime) ? 'audio' : (/video/i.test(mime) ? 'video' : null);
+      // Remember the LATEST SourceBuffer per kind so the capture loop can read the
+      // track's OWN buffered edge. The element's v.buffered is the UNION across tracks,
+      // which lies when audio buffers ahead of video (high bitrates) — the union edge
+      // would then "complete" a capture whose video track is still short.
+      if (sb.__ytdlKind) store.sb[sb.__ytdlKind] = sb;
     } catch (e) {}
     return sb;
   };
@@ -101,6 +108,11 @@
               // restarted (remove() + new init). Everything before is no longer
               // contiguous, so start the track over at the new init instead of
               // gluing two init segments together (which would corrupt the file).
+              // If the track already had data, the restart CUT it short — count it so
+              // the result is honestly reported as incomplete.
+              if (store.tracks[kind]) {
+                store.restarts[kind] = (store.restarts[kind] || 0) + 1;
+              }
               store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [u8.slice()] };
             } else {
               const t = store.tracks[kind];
@@ -196,7 +208,7 @@
   }
   async function menuSetQuality(wantH) {
     const gear = document.querySelector('.ytp-settings-button');
-    if (!gear) return false;
+    if (!gear) { console.log('[YTDL] menuSetQuality: no gear button'); return false; }
     const isOpen = () => {
       try {
         const m = document.querySelector('.ytp-settings-menu');
@@ -215,7 +227,7 @@
       gear.click(); // open the settings menu
       for (let i = 0; i < 20 && !items().length; i++) await sleep(150);
       const qItem = items().find(it => /качеств|quality/i.test(menuItemLabel(it)));
-      if (!qItem) { closeIfOpen(); return false; }
+      if (!qItem) { closeIfOpen(); console.log('[YTDL] menuSetQuality: no quality entry'); return false; }
       qItem.click();
       let qItems = [];
       for (let i = 0; i < 25; i++) {
@@ -223,18 +235,19 @@
         if (qItems.length) break;
         await sleep(150);
       }
-      if (!qItems.length) { closeIfOpen(); return false; }
+      if (!qItems.length) { closeIfOpen(); console.log('[YTDL] menuSetQuality: no visible quality items'); return false; }
       // Prefer the exact "1440p" entry over "1440p60"; accept any variant that starts
       // with the target height (labels normalize to digits: "1440p60" → "144060").
       const norm = (t) => String(t).replace(/[^0-9]/g, '');
       const target = qItems.filter(it => norm(menuItemLabel(it)) === String(wantH))[0]
                   || qItems.filter(it => norm(menuItemLabel(it)).startsWith(String(wantH)))[0];
-      if (!target) { closeIfOpen(); return false; }
+      if (!target) { closeIfOpen(); console.log('[YTDL] menuSetQuality: no entry for ' + wantH, qItems.map(menuItemLabel)); return false; }
       target.click();
       await sleep(250);
       closeIfOpen(); // the menu may auto-close on selection; close it if it didn't
+      console.log('[YTDL] menuSetQuality: selected', wantH);
       return true;
-    } catch (e) { closeIfOpen(); return false; }
+    } catch (e) { closeIfOpen(); console.log('[YTDL] menuSetQuality exception:', e); return false; }
   }
   // Seek via the player API, which also updates YouTube's app-level streaming
   // position — plain v.currentTime only moves the element, so the player would
@@ -295,41 +308,49 @@
     //     capStart, so that seeking to capStart afterwards is a real jump. That jump
     //     forces BOTH tracks to re-fetch — important because the audio itag is the
     //     same Opus at every quality, so a quality switch alone won't re-init audio.
-    //  2) start recording, switch to the target quality, then seek to capStart.
-    //     Capture begins at the requested fragment — not at the start of the video.
+    //  2) force the target quality and VERIFY the player actually serves it — all
+    //     while recording is still OFF — and only then start recording and seek to
+    //     capStart. Capture begins at the requested fragment, not the video's start.
     const preSeek = capStart > 10 ? 0 : Math.min(35, Math.max(1, dur - 5));
     setQualityRaw(preQ);
     await sleep(500);
     seekVia(preSeek);
     await sleep(700);
 
-    // Force the requested quality. The JS API is unreliable for high-res (it can keep
-    // serving 720p), so select via the native settings menu — the same path a user clicks
-    // manually — and keep the API call as belt-and-braces. No player layout is changed.
+    // Force the requested quality BEFORE recording anything. The JS API is unreliable
+    // for high-res (it can keep serving 720p), so select via the native settings menu —
+    // the same path a user clicks manually — and keep the API call as belt-and-braces.
+    // Re-applying the quality while capturing is dangerous: every switch re-inits the
+    // SourceBuffer and would CUT the recorded track. So all of it happens here, with
+    // recording off — any re-init merely refreshes lastInit.
     const menuOk = highRes ? await menuSetQuality(wantRes) : false;
     setQualityRaw(targetQ);
-
-    resetTracks();
-    store.capturing = true;
-    seekVia(capStart);
-    await sleep(500);
-
-    // Wait until the tracks we need have their init AND the player is actually serving
-    // the requested resolution. A single quality call can be ignored by the modern ABR
-    // player, so keep re-applying it while waiting; if a fresh init arrives mid-setup
-    // (quality switch), appendBuffer restarts the track (see re-init handling), so any
-    // low-res lead-in is discarded automatically.
-    const haveInits = () => store.tracks.audio && (!needVideo || store.tracks.video);
     // When the native menu couldn't be driven (menuOk false), the JS API alone rarely
     // lifts the resolution, so don't burn the full 16 s polling videoHeight — a short
     // re-apply window still covers the rare case where the API IS honoured, and the
     // honest actualH report remains the safety net.
-    const waitIter = highRes && menuOk ? 80 : 20;
-    for (let i = 0; i < waitIter; i++) {
-      if (haveInits() && (!highRes || servedHeight() >= wantH)) break;
+    const verifyIter = highRes ? (menuOk ? 80 : 20) : 0;
+    for (let i = 0; i < verifyIter; i++) {
+      if (servedHeight() >= wantH) break;
       if (i % 2 === 0) setQualityRaw(targetQ);
       await sleep(200);
     }
+
+    resetTracks();
+    // NOTE: store.sb is NOT reset here — the SourceBuffers were created when the player
+    // loaded and the addSourceBuffer patch already registered the current ones. Wiping
+    // them would blind trackEdge() and the per-track capture loop would fall back to the
+    // union edge (the very freeze bug we're fixing).
+    store.restarts = Object.create(null);
+    store.capturing = true;
+    seekVia(capStart);
+    await sleep(500);
+
+    // Wait until both tracks we need start appending (their init arrives). From here on
+    // the quality is NEVER touched again — a switch mid-recording would re-init and cut
+    // the track short, which is why any such restart is tracked and reported as partial.
+    const haveInits = () => store.tracks.audio && (!needVideo || store.tracks.video);
+    for (let i = 0; i < 40 && !haveInits(); i++) await sleep(200);
 
     // Seek-driven capture — NO fast playback. The player buffers a window ahead
     // while paused, then plateaus; we hop the scrubber to the buffered edge to pull
@@ -353,6 +374,23 @@
       }
       return t;
     };
+    // Per-track buffered edge. v.buffered is the UNION across SourceBuffers: at high
+    // bitrates the audio buffer can extend far beyond the video one, so the union edge
+    // would "complete" the capture while the VIDEO track is still a few seconds long —
+    // producing a file that freezes on the last decoded frame (video ends, audio runs on).
+    // Driving hops and completion off the real per-track edges keeps them advancing
+    // together. Falls back to the union edge only when a SourceBuffer reference is stale.
+    const trackEdge = (kind, t) => {
+      try {
+        const sb = store.sb[kind];
+        if (!sb) return 0;
+        const b = sb.buffered;
+        for (let i = 0; i < b.length; i++) {
+          if (b.start(i) <= t + 0.5 && b.end(i) >= t) return b.end(i);
+        }
+        return 0;
+      } catch (e) { return 0; }
+    };
     let capturedFrom = capStart;
     let cursor = capStart, stall = 0;
     let complete = false;
@@ -367,9 +405,17 @@
         if (vidId() !== capId) throw new Error('видео переключилось во время захвата');
         try { if (!v.paused) v.pause(); } catch (e) {} // keep it paused; buffering runs anyway
 
-        const edge = bufferedEndAt(cursor);
+        const unionEdge = bufferedEndAt(cursor);
+        const vRaw = needVideo ? trackEdge('video', cursor) : capEnd;
+        const aRaw = trackEdge('audio', cursor);
+        const vE = vRaw || unionEdge;
+        const aE = aRaw || unionEdge;
+        const edge = Math.min(vE, aE, capEnd);
         onProgress(Math.min(0.99, Math.max(0, edge - capStart) / span));
-        if (edge >= capEnd - 0.6) { complete = true; break; } // range fully buffered → captured
+        // Complete ONLY when the RAW per-track edges reached the end. A fallback union
+        // edge must never count — audio's far-ahead buffer would declare a short video
+        // track done and we'd ship the frozen-frame file again.
+        if (vRaw >= capEnd - 0.6 && aRaw >= capEnd - 0.6) { complete = true; break; }
         if (totalCaptured() > BYTE_CAP) break;          // memory safety valve → incomplete
 
         if (edge > cursor + 0.3) {                       // window extended → hop to the edge
@@ -385,6 +431,25 @@
       }
       capturedFrom = Math.min(capturedFrom, bufferedStartAt(capStart));
       actualH = servedHeight(); // resolution the player actually served during capture
+      // Buffer-eviction guard: if the browser evicted the START of the buffered range
+      // (memory pressure), the per-track edges can still reach capEnd while the captured
+      // track is missing [capStart, evictPoint] — no init involved, so no restart was
+      // counted, and a full-video download skips trimming → would silently ship a short
+      // file. Completing therefore also requires the video buffer to still cover the
+      // capture start.
+      if (complete && needVideo) {
+        try {
+          const sb = store.sb.video;
+          if (sb) {
+            const b = sb.buffered;
+            let covers = false;
+            for (let i = 0; i < b.length; i++) {
+              if (b.start(i) <= capStart + 0.5 && b.end(i) >= capStart) { covers = true; break; }
+            }
+            if (!covers) complete = false;
+          }
+        } catch (e) {}
+      }
     } finally {
       store.capturing = false;
       // restore player state
@@ -394,8 +459,16 @@
       keepAutoplayOff(); // leave autoplay disabled — don't turn it back on
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
+    // A mid-capture re-init (quality switch / buffer flush) REPLACED a track, so part of
+    // the range is missing from the file — report honestly as incomplete.
+    const restartCount = (store.restarts.video || 0) + (store.restarts.audio || 0);
+    if (restartCount > 0) complete = false;
+    console.log('[YTDL] capture', {
+      menuOk, targetQ, requestedH: wantRes, servedH: actualH, complete, restarts: restartCount,
+      bytes: totalCaptured(),
+    });
     onProgress(1);
-    return { capturedFrom: Math.max(0, capturedFrom), complete, actualH: actualH || 0 };
+    return { capturedFrom: Math.max(0, capturedFrom), complete, actualH: actualH || 0, restarts: restartCount };
   }
 
   // ---- subtitles (read from the built-in transcript panel) -----------------
@@ -602,7 +675,8 @@
         if (!aud) throw new Error('не удалось захватить аудио');
         const payload = {
           ok: true, done: true,
-          complete: !!cap.complete,         // false when capture broke (stall/cap) — file may be cut
+          complete: !!cap.complete,         // false when capture broke (stall/cap/restart) — file may be cut
+          restarts: cap.restarts || 0,     // mid-capture re-inits that CUT a track
           capturedFrom: cap.capturedFrom,   // where the captured file actually begins
           height: cap.actualH || 0,         // resolution the player actually served
           audio: { mime: aud.mime, size: aud.bytes.byteLength },
@@ -631,6 +705,8 @@
       store.videoId = vidId();
       resetTracks();
       store.lastInit = Object.create(null); // inits from the previous video are stale
+      store.sb = Object.create(null);
+      store.restarts = Object.create(null);
       store.capturing = false;
     }
     scheduleAutoplayOff();

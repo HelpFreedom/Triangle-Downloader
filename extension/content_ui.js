@@ -461,7 +461,11 @@
       });
 
       if (!res || !res.ok) throw new Error(res && res.error || 'mux failed');
-      const partialNote = result.complete === false ? ' — захват неполный, файл может быть обрезан' : '';
+      const partialNote = result.complete === false
+        ? (result.restarts > 0
+            ? ' — во время захвата переключилось качество, файл может быть обрезан'
+            : ' — захват неполный, файл может быть обрезан')
+        : '';
       const resNote = downgraded ? ' — плеер отдал ' + actualH + 'p вместо ' + height + 'p' : '';
       t.set(prefix + 'Готово: ' + (res.filename || filename) +
         (alignedStart ? ' — начало выровнено по опорному кадру' : '') + partialNote + resNote, 1);

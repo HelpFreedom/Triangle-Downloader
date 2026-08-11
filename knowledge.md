@@ -89,12 +89,23 @@ All code lives in `extension/`. The extension is split into three contexts commu
   even when `setPlaybackQualityRange('hd2160','hd2160')` is called. For high-res targets
   (`RES_H[target] > 700`, i.e. 1440p/2160p) `playthrough()` selects the quality through the
   **native settings menu** (`menuSetQuality` — opens the gear, picks the exact "Np" entry,
-  closes it; the same path the user clicks manually, which the user confirmed works), then keeps
-  re-applying the JS quality API while polling `video.videoHeight` against `RES_H` thresholds
-  (up to ~16 s). NO player layout is touched (no theater mode — `setTheaterModeRequested`
-  toggles instead of setting, and it broke the user's wide layout). The download reply carries
-  the actually-served `height`; `content_ui.js` names the file after the real resolution and
+  closes it on every exit path; the same path the user clicks manually, which the user
+  confirmed works), then re-applies the JS quality API while polling `video.videoHeight`
+  against `RES_H` thresholds (up to ~16 s) — ALL **before** recording starts, because
+  re-applying quality DURING capture would re-init the SourceBuffer and cut the track.
+  NO player layout is touched (no theater mode — `setTheaterModeRequested` toggles instead
+  of setting, and it broke the user's wide layout). The download reply carries the
+  actually-served `height`; `content_ui.js` names the file after the real resolution and
   toasts "плеер отдал Np вместо Mp" when downgraded.
+- **Capture loop must use PER-TRACK buffered edges, never the union**: `video.buffered` is the
+  union across SourceBuffers, and at high bitrates the audio buffer extends far beyond the
+  video one — the union edge would "complete" a capture whose VIDEO track is only a few
+  seconds long (symptom: the file freezes on the last decoded frame and is tiny).
+  `content_hook.js` stores the latest SourceBuffer per kind in `store.sb` and drives hops and
+  completion off `trackEdge()` per track; completion requires BOTH raw edges to reach the end.
+- **Mid-capture re-init CUTS the track**: a fresh init while recording replaces that track
+  (`store.restarts` counter, counted only when the track already had data). Any restart ⇒
+  `complete:false`, so the UI warns "во время захвата переключилось качество".
 - **User must run an ad blocker (uBlock Origin)** — without it YouTube injects ad breaks into
   the media stream and capture fails. This is stated in the README as a hard requirement.
 - **Never retry `ytdl-finalize`** — a repeated finalize re-runs ffmpeg on already-freed data.
