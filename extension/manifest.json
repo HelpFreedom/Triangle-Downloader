@@ -4,7 +4,7 @@
   "version": "1.4.2",
   "minimum_chrome_version": "116",
   "description": "Скачивает открытое видео YouTube (720p–2160p mp4, mp3, выбор фрагмента), перехватывая поток самого плеера. Без yt-dlp и внешних сервисов.",
-  "permissions": ["downloads", "offscreen", "storage"],
+  "permissions": ["downloads", "offscreen", "storage", "system.memory"],
   "host_permissions": ["*://www.youtube.com/*"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [

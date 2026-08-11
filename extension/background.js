@@ -28,6 +28,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // async
   }
 
+  if (msg.t === 'ytdl-mem') {
+    // Adaptive capture-size warning needs real available RAM. chrome.system.* is not
+    // available in content scripts, so the UI asks here. Bytes → MB.
+    try {
+      chrome.system.memory.getInfo((info) => {
+        sendResponse({
+          ok: true,
+          capacity: Math.round(info.capacity / 1048576),
+          free: Math.round(info.availableCapacity / 1048576),
+        });
+      });
+      return true; // async
+    } catch (e) {
+      sendResponse({ ok: false, error: String(e) });
+    }
+  }
+
   if (msg.t === 'ytdl-save') {
     // Offscreen finished muxing and handed us a blob URL to save. downloads.download
     // resolves when the download STARTS; the blob must stay alive until the browser

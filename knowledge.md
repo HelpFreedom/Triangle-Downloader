@@ -6,7 +6,7 @@ This file gives Freebuff context about your project: goals, commands, convention
 
 **Triangle Downloader** — a Chrome extension (Manifest V3) that adds a ▽ button into the
 YouTube player and lets users download the current video (720p–2160p `.mp4`, depending on
-availability), audio (`.mp3`),
+availability — long videos can be split into ~15-min parts), audio (`.mp3`),
 and subtitles (`.txt`), plus select a start–end fragment. It works by capturing the player's
 own decrypted MSE stream locally — no `yt-dlp`, no external servers. UI strings and user-facing
 errors are in **Russian**; code comments are in English. Docs: `README.md` (ru) / `README.en.md`.
@@ -62,6 +62,9 @@ All code lives in `extension/`. The extension is split into three contexts commu
   - `ytdl-finalize` → run ffmpeg, reply with `{ ok, filename }`.
   - `ytdl-progress` → offscreen→content_ui ffmpeg progress event.
   - `ytdl-save` → content_ui/offscreen → background → `chrome.downloads.download`.
+  - `ytdl-mem` → content_ui → background → `chrome.system.memory.getInfo()` (capacity /
+    free MB) — feeds the adaptive large-capture warning; falls back to
+    `navigator.deviceMemory` (capped at 8 GB) if unavailable.
 
 ## Conventions
 
@@ -88,6 +91,12 @@ All code lives in `extension/`. The extension is split into three contexts commu
   Chunk sends are retried once (SW may have been asleep); finalize is not.
 - `background.js` is a service worker — it can go to sleep; `content_ui.js` sends
   `ytdl-ensure` and pings before every transfer.
+- **Parts feature**: the menu toggle «По частям» (`chrome.storage.local` key `parts`) splits
+  ranges longer than `PART_MAX_SEC` (15 min) into sequential independent downloads named
+  `(part N of M)`. The adaptive warning (`adaptiveWarning` in content_ui.js) estimates
+  capture size (EST_MBPS × seconds × PEAK_MULT ≈ 4× RAM peak) and compares it against 25%
+  of real free RAM; it offers parts / whole / cancel via a DOM modal (Trusted Types-safe).
+  Constants: `PART_MAX_SEC`, `PEAK_MULT`, `WARN_FRACTION`, `MIN_EST_MB` in content_ui.js.
 - Capture is seek-driven and works only while `vidId()` matches (aborts if the user navigates
   to another video); it only runs on `youtube.com/watch` pages.
 - Transcoding (H.264, mp3) is single-threaded ffmpeg.wasm — can take minutes on long videos.
