@@ -93,6 +93,10 @@ All code lives in `extension/`. The extension is split into three contexts commu
 - **Exact cuts ≤ 60s** (`EXACT_CUT_MAX_SEC` in `content_ui.js`) get a re-encode; longer
   fragments are stream-copied and start at the keyframe *before* the requested point (a note is
   shown in the toast). The copy path always uses `-avoid_negative_ts make_zero`.
+  **Frame-accurate cuts at high resolution are SLOW by design**: 2160p is 4× the pixels of
+  1080p and ffmpeg.wasm is single-threaded WASM (~5–10× slower than native), so a 20 s exact
+  cut at 2160p takes minutes even with the `ultrafast` preset (auto-picked via
+  `quickEncode = exactCut && !transcode`). This is expected, not a regression — verified live.
 - **Resolution verification**: the modern ABR player can silently serve a lower resolution
   even when `setPlaybackQualityRange('hd2160','hd2160')` is called. For high-res targets
   (`RES_H[target] > 700`, i.e. 1440p/2160p) `playthrough()` selects the quality through the
