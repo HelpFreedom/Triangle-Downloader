@@ -2,6 +2,9 @@
 // the YouTube player, drives the MAIN-world capture hook over window.postMessage,
 // then streams the captured tracks to the offscreen ffmpeg worker for muxing.
 (function () {
+  // Shared pure helpers (time / trim / base64 / filenames) — provided by lib/format.js,
+  // which the manifest injects BEFORE this script in the same isolated world.
+  const L = window.YTDL_LIB;
   const BTN_ID = 'ytdl-btn';
   // Clips up to this length get an exact (re-encoded) cut; longer ones are copied
   // instantly and start at the keyframe before the requested point. Re-encoding costs
@@ -51,20 +54,6 @@
       window.addEventListener('message', handler);
       window.postMessage(Object.assign({ __ytdl_to_hook: true, cmd: 'download', reqId }, params), '*');
     });
-  }
-
-  // ---- time helpers --------------------------------------------------------
-  function fmtTime(sec) {
-    sec = Math.max(0, Math.floor(sec || 0));
-    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-    const pad = (n) => String(n).padStart(2, '0');
-    return h + ':' + pad(m) + ':' + pad(s);
-  }
-  function parseTime(str) {
-    const parts = String(str).trim().split(':').map((p) => Number(p));
-    if (!parts.length || parts.some((n) => Number.isNaN(n))) return null;
-    let s = 0; for (const p of parts) s = s * 60 + p;
-    return s;
   }
 
   // ---- dom helpers (no innerHTML — the page enforces Trusted Types) ---------
@@ -137,12 +126,6 @@
     const gb = navigator.deviceMemory || 8;
     memInfo = { capacityMB: gb * 1024, freeMB: gb * 1024 };
     return memInfo;
-  }
-
-  function splitRange(start, end, partSec) {
-    const parts = [];
-    for (let s = start; s < end; s += partSec) parts.push({ start: s, end: Math.min(s + partSec, end) });
-    return parts;
   }
 
   // Adaptive large-capture warning: returns 'parts' | 'single' | 'cancel' — or null when
@@ -227,16 +210,16 @@
     const inStart = document.createElement('input');
     const inEnd = document.createElement('input');
     inStart.className = inEnd.className = 'ytdl-time';
-    inStart.value = fmtTime(0);
-    inEnd.value = fmtTime(duration);
+    inStart.value = L.fmtTime(0);
+    inEnd.value = L.fmtTime(duration);
     [inStart, inEnd].forEach((i) => i.addEventListener('click', (ev) => ev.stopPropagation()));
     const dash = document.createElement('span'); dash.className = 'ytdl-frag-dash'; dash.textContent = '—';
     frag.appendChild(inStart); frag.appendChild(dash); frag.appendChild(inEnd);
     menuEl.appendChild(frag);
 
     function fragment() {
-      let start = parseTime(inStart.value);
-      let end = parseTime(inEnd.value);
+      let start = L.parseTime(inStart.value);
+      let end = L.parseTime(inEnd.value);
       if (start == null) start = 0;
       if (end == null || end <= 0) end = duration;
       start = Math.max(0, Math.min(start, duration));
@@ -255,12 +238,12 @@
           const range = f.end - f.start;
           // Toggle on → always split long ranges; otherwise the adaptive warning may
           // suggest parts for a large capture.
-          const parts = partsOn && range > PART_MAX_SEC ? splitRange(f.start, f.end, PART_MAX_SEC) : null;
+          const parts = partsOn && range > PART_MAX_SEC ? L.splitRange(f.start, f.end, PART_MAX_SEC) : null;
           if (parts) { startParts({ format: 'mp4', height: h }, info, current, parts); return; }
           const decision = await adaptiveWarning(h, f.start, f.end);
           if (decision === 'cancel') return;
           if (decision === 'parts') {
-            startParts({ format: 'mp4', height: h }, info, current, splitRange(f.start, f.end, PART_MAX_SEC));
+            startParts({ format: 'mp4', height: h }, info, current, L.splitRange(f.start, f.end, PART_MAX_SEC));
             return;
           }
           startDownload({ format: 'mp4', height: h, start: f.start, end: f.end }, info, current);
@@ -278,7 +261,7 @@
       const range = f.end - f.start;
       // mp3 is tiny memory-wise; the toggle only matters to stay under the capture time cap.
       if (partsOn && range > PART_MAX_SEC) {
-        startParts({ format: 'mp3', height: null }, info, current, splitRange(f.start, f.end, PART_MAX_SEC));
+        startParts({ format: 'mp3', height: null }, info, current, L.splitRange(f.start, f.end, PART_MAX_SEC));
         return;
       }
       startDownload({ format: 'mp3', height: null, start: f.start, end: f.end }, info, current);
@@ -366,21 +349,13 @@
     };
   }
 
-  function safeName(s) {
-    return (s || 'video').replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
-  }
-  function fragSuffix(start, end, duration) {
-    if (start <= 0 && end >= duration - 0.5) return '';
-    return ' (' + fmtTime(start).replace(/:/g, '.') + '-' + fmtTime(end).replace(/:/g, '.') + ')';
-  }
-
   async function downloadSubtitles(info) {
     const t = toast();
     t.set('Открываю расшифровку…', 0.3);
     try {
       const res = await callHook('subtitles');
       if (!res || !res.ok) throw new Error((res && res.error) || 'нет субтитров');
-      const filename = safeName(info.title) + ' [' + (res.lang || 'txt') + '].txt';
+      const filename = L.safeName(info.title) + ' [' + (res.lang || 'txt') + '].txt';
       // small text → a data URL is enough; BOM keeps Cyrillic correct on Windows
       const url = 'data:text/plain;charset=utf-8,' + encodeURIComponent('﻿' + res.text);
       const save = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename });
@@ -422,26 +397,15 @@
       const actualH = result.height || 0;
       const downgraded = !isMp3 && actualH >= 100 && actualH < height;
       const effH = downgraded ? actualH : height;
-      const filename = safeName(info.title) + (isMp3 ? '' : ' [' + effH + 'p]') +
-        (opts.partLabel || fragSuffix(start, end, duration)) + ext;
+      const filename = L.safeName(info.title) + (isMp3 ? '' : ' [' + effH + 'p]') +
+        (opts.partLabel || L.fragSuffix(start, end, duration)) + ext;
 
       // Capture starts at a segment boundary at or before `start`, so trimming must be
       // RELATIVE to the captured file — ffmpeg's -ss counts from the file's own start,
       // not from the video's absolute timeline.
       const capturedFrom = typeof result.capturedFrom === 'number' ? result.capturedFrom : start;
-      const trimStart = Math.max(0, start - capturedFrom);
-      const trimDuration = Math.max(0, end - start);
-      const isFragment = start > 0 || end < duration - 0.5;
-
-      // A copied stream can only start on a keyframe, so an exact start needs
-      // re-encoding. That costs roughly the clip's own length, so we only do it
-      // automatically for short clips; longer ones stay instant and start at the
-      // keyframe just before the requested point.
-      const needsExactCut = isFragment && trimStart > 0.3;
-      const shortEnough = trimDuration > 0 && trimDuration <= EXACT_CUT_MAX_SEC;
-      const exactCut = !isMp3 && needsExactCut && shortEnough;
-      const doTranscode = isMp3 ? true : (!!transcode || exactCut);
-      const alignedStart = !isMp3 && needsExactCut && !doTranscode;
+      const job = L.computeJob({ start, end, duration, capturedFrom, isMp3, transcode, exactCutMaxSec: EXACT_CUT_MAX_SEC });
+      const { trimStart, trimDuration, isFragment, exactCut, doTranscode, alignedStart, quickEncode } = job;
 
       t.set(prefix + (isMp3 ? 'Кодирование MP3…'
         : (exactCut ? 'Точная обрезка фрагмента (перекодирование)…'
@@ -454,7 +418,7 @@
         audio: result._a,
         videoMime: result.video && result.video.mime,
         audioMime: result.audio && result.audio.mime,
-        filename, transcode: doTranscode, quickEncode: exactCut && !transcode,
+        filename, transcode: doTranscode, quickEncode,
         trimStart,
         // only limit duration when a real fragment was requested
         trimDuration: isFragment ? trimDuration : 0,
@@ -517,15 +481,6 @@
   }
 
   // ---- transfer to offscreen ffmpeg ---------------------------------------
-  function b64encode(u8) {
-    let s = '';
-    const STEP = 0x8000;
-    for (let i = 0; i < u8.length; i += STEP) {
-      s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + STEP, u8.length)));
-    }
-    return btoa(s);
-  }
-
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // The ffmpeg side lives in an offscreen document that the service worker creates on
@@ -578,7 +533,7 @@
       const view = new Uint8Array(buf);
       for (let off = 0; off < view.length; off += CHUNK) {
         const slice = view.subarray(off, Math.min(off + CHUNK, view.length));
-        const r = await sendToOffscreen({ t: 'ytdl-chunk', track: name, seq, b64: b64encode(slice) });
+        const r = await sendToOffscreen({ t: 'ytdl-chunk', track: name, seq, b64: L.b64encode(slice) });
         if (!r || !r.ok) {
           throw new Error('передача данных прервалась (' + name + ')' + (r && r.error ? ': ' + r.error : ''));
         }

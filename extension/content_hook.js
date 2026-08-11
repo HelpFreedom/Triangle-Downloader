@@ -33,6 +33,13 @@
   function vidId() { try { return new URLSearchParams(location.search).get('v'); } catch (e) { return null; } }
   function resetTracks() { store.tracks = Object.create(null); }
 
+  // Verbose diagnostics are OFF by default. Flip DEBUG to true when debugging
+  // quality/capture issues — the logs show the actual served resolution, mid-capture
+  // re-inits, and the menu selection result on a live player (they were the only way
+  // to diagnose the external "YouTube Auto HD + FPS" conflict, see knowledge.md).
+  const DEBUG = false;
+  const dbg = (...a) => { if (DEBUG) console.log('[YTDL]', ...a); };
+
   // ---- steer the player away from AV1 -------------------------------------
   // The bundled ffmpeg core can decode VP9/Opus but NOT AV1. YouTube only picks
   // AV1 when the page reports it as decodable, so — before the player probes —
@@ -208,7 +215,7 @@
   }
   async function menuSetQuality(wantH) {
     const gear = document.querySelector('.ytp-settings-button');
-    if (!gear) { console.log('[YTDL] menuSetQuality: no gear button'); return false; }
+    if (!gear) { dbg('menuSetQuality: no gear button'); return false; }
     const isOpen = () => {
       try {
         const m = document.querySelector('.ytp-settings-menu');
@@ -227,7 +234,7 @@
       gear.click(); // open the settings menu
       for (let i = 0; i < 20 && !items().length; i++) await sleep(150);
       const qItem = items().find(it => /качеств|quality/i.test(menuItemLabel(it)));
-      if (!qItem) { closeIfOpen(); console.log('[YTDL] menuSetQuality: no quality entry'); return false; }
+      if (!qItem) { closeIfOpen(); dbg('menuSetQuality: no quality entry'); return false; }
       qItem.click();
       let qItems = [];
       for (let i = 0; i < 25; i++) {
@@ -235,19 +242,19 @@
         if (qItems.length) break;
         await sleep(150);
       }
-      if (!qItems.length) { closeIfOpen(); console.log('[YTDL] menuSetQuality: no visible quality items'); return false; }
+      if (!qItems.length) { closeIfOpen(); dbg('menuSetQuality: no visible quality items'); return false; }
       // Prefer the exact "1440p" entry over "1440p60"; accept any variant that starts
       // with the target height (labels normalize to digits: "1440p60" → "144060").
       const norm = (t) => String(t).replace(/[^0-9]/g, '');
       const target = qItems.filter(it => norm(menuItemLabel(it)) === String(wantH))[0]
                   || qItems.filter(it => norm(menuItemLabel(it)).startsWith(String(wantH)))[0];
-      if (!target) { closeIfOpen(); console.log('[YTDL] menuSetQuality: no entry for ' + wantH, qItems.map(menuItemLabel)); return false; }
+      if (!target) { closeIfOpen(); dbg('menuSetQuality: no entry for', wantH, qItems.map(menuItemLabel)); return false; }
       target.click();
       await sleep(250);
       closeIfOpen(); // the menu may auto-close on selection; close it if it didn't
-      console.log('[YTDL] menuSetQuality: selected', wantH);
+      dbg('menuSetQuality: selected', wantH);
       return true;
-    } catch (e) { closeIfOpen(); console.log('[YTDL] menuSetQuality exception:', e); return false; }
+    } catch (e) { closeIfOpen(); dbg('menuSetQuality exception:', e); return false; }
   }
   // Seek via the player API, which also updates YouTube's app-level streaming
   // position — plain v.currentTime only moves the element, so the player would
@@ -346,10 +353,10 @@
       qAfter = (() => { try { return player().getPlaybackQuality(); } catch (e) { return '?'; } })();
       if (menuOk && qAfter !== '?' && !String(qAfter).startsWith(targetQ)) {
         setQualityRaw(targetQ);
-        console.log('[YTDL] quality: menu ok but player reports', qAfter, '— falling back to API');
+        dbg('quality: menu ok but player reports', qAfter, '— falling back to API');
       }
     }
-    console.log('[YTDL] quality', { menuOk, before: qBefore, after: qAfter });
+    dbg('quality', { menuOk, before: qBefore, after: qAfter });
     // When the native menu couldn't be driven (menuOk false), the JS API alone rarely
     // lifts the resolution, so don't burn the full 16 s polling videoHeight — a short
     // re-apply window still covers the rare case where the API IS honoured, and the
@@ -490,7 +497,7 @@
     if (restartCount > 0) complete = false;
     // NOTE: restarts/bytes are logged as SEPARATE arguments because Chrome's console
     // collapses an object into "{...}" when copied, hiding the values.
-    console.log('[YTDL] capture', { menuOk, targetQ, requestedH: wantRes, servedH: actualH, complete }, 'restarts:', restartCount, 'bytes:', totalCaptured());
+    dbg('capture', { menuOk, targetQ, requestedH: wantRes, servedH: actualH, complete }, 'restarts:', restartCount, 'bytes:', totalCaptured());
 
     onProgress(1);
     return { capturedFrom: Math.max(0, capturedFrom), complete, actualH: actualH || 0, restarts: restartCount };
@@ -749,5 +756,5 @@
   scheduleAutoplayOff();
 
   store.videoId = vidId();
-  console.log('[YTDL] MSE capture hook installed');
+  dbg('MSE capture hook installed');
 })();

@@ -16,7 +16,11 @@ errors are in **Russian**; code comments are in English. Docs: `README.md` (ru) 
 - **Setup / Dev**: edit files, then load unpacked from `chrome://extensions` → Developer mode →
   **Load unpacked** → select the **`extension/`** folder. Reload the extension after edits
   (and refresh the YouTube tab for `content_hook.js` changes).
-- **Test / lint / build**: none exist — validate manually in a real YouTube session.
+- **Test**: `node --test tests/` — node:test suite (Node 18+, zero deps) for the pure
+  helpers in `extension/lib/format.js` (time/trim matrix/base64/run cascade). No linter or
+  build step.
+- **Debug**: `DEBUG` flag at the top of `content_hook.js` (off by default) re-enables the
+  `[YTDL]` diagnostics that were used to chase the quality/capture issues.
 
 ## Architecture
 
@@ -42,6 +46,10 @@ All code lives in `extension/`. The extension is split into three contexts commu
   chunks, assembles the final file: fast `-c copy` remux (VP9/Opus into mp4/webm), H.264/AAC
   re-encode, or mp3 (libmp3lame). Tries a cascade of ffmpeg run variants, keeps the first
   non-empty result.
+- **`lib/format.js`** — shared PURE helpers (time/trim/base64/filenames/ffmpeg run
+  cascade), registered as `globalThis.YTDL_LIB`. Injected by the manifest before
+  `content_ui.js` (ISOLATED world) and by `offscreen.html` before `offscreen.js`; also
+  `require()`d by `tests/format.test.js` — same code in prod and tests.
 - **`content_ui.css`** — player button, menu, toast styles.
 - **`extension/vendor/ffmpeg/`** — bundled ffmpeg.wasm builds (`@ffmpeg/ffmpeg@0.12.10`,
   `@ffmpeg/core@0.12.6`, single-threaded, no cross-origin isolation needed). `ffmpeg-core.wasm`

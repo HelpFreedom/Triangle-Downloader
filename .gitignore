@@ -13,3 +13,7 @@ package-lock.json
 .DS_Store
 Thumbs.db
 *~
+
+# Local diagnostics (user-saved console copies)
+log.txt
+Log.txt

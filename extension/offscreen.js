@@ -5,6 +5,9 @@
 // or VP9 video + Opus audio), so this re-encodes rather than remuxes.
 
 const { FFmpeg } = FFmpegWASM;
+// Shared pure helpers (base64 / byte concat / MIME→ext / ffmpeg run cascade) from
+// lib/format.js, loaded by offscreen.html BEFORE this script.
+const L = window.YTDL_LIB;
 
 let ff = null;
 let ffLoading = null;
@@ -35,38 +38,19 @@ async function getFF() {
   return ffLoading;
 }
 
-function b64decode(s) {
-  const bin = atob(s);
-  const u8 = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-  return u8;
-}
-
-function concat(parts) {
-  let n = 0; for (const p of parts) n += p.length;
-  const out = new Uint8Array(n);
-  let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
-  return out;
-}
-function extFor(mime) {
-  if (/webm/i.test(mime)) return 'webm';
-  if (/mp4/i.test(mime)) return 'mp4';
-  return 'bin';
-}
-
 async function finalize() {
   const inst = await getFF();
   const isMp3 = acc.format === 'mp3';
-  const aName = 'a.' + extFor(acc.audioMime);
+  const aName = 'a.' + L.extFor(acc.audioMime);
 
-  const aBytes = concat(acc.audio);
+  const aBytes = L.concat(acc.audio);
   if (!aBytes.length) throw new Error('пустые данные аудио');
   await inst.writeFile(aName, aBytes);
 
   let vName = null;
   if (!isMp3) {
-    vName = 'v.' + extFor(acc.videoMime);
-    const vBytes = concat(acc.video);
+    vName = 'v.' + L.extFor(acc.videoMime);
+    const vBytes = L.concat(acc.video);
     if (!vBytes.length) throw new Error('пустые данные видео');
     await inst.writeFile(vName, vBytes);
   }
@@ -77,66 +61,12 @@ async function finalize() {
   // Passing an absolute position produced an empty file (0 bytes of output).
   const trimStart = Math.max(0, Number(acc.trimStart) || 0);
   const trimDuration = Math.max(0, Number(acc.trimDuration) || 0);
-  // Re-encoding cuts frame-accurately, so it seeks to the exact requested point.
-  // A stream copy cannot: video can only start on a keyframe while audio would be cut
-  // precisely, which leaves the lead-in silent. So the copy path seeks nothing and just
-  // limits the length — both tracks start together at the keyframe before the request.
-  const exact = !!acc.transcode;
-  const seek = exact && trimStart > 0.05 ? ['-ss', trimStart.toFixed(3)] : [];
-  const limit = trimDuration > 0.05
-    ? ['-t', (exact ? trimDuration : trimStart + trimDuration).toFixed(3)]
-    : [];
-  const inV = (s) => (vName ? [...s, '-i', vName] : []);
-  const inA = (s) => [...s, '-i', aName];
-  // Stream copy can only cut on keyframes, so a trimmed copy starts at the keyframe
-  // BEFORE the requested point. MP4 can hide that lead-in with an edit list, but the
-  // skipped frames stay inside the file and players that take the duration from the
-  // media track then show a frozen tail at the end. So the copy path always normalizes
-  // timestamps (lead-in becomes ordinary content) and exact cuts are produced by
-  // re-encoding instead — see the "exact cut" decision in content_ui.js.
-  const ZERO = ['-avoid_negative_ts', 'make_zero'];
-
-  const runs = [];
-  if (isMp3) {
-    runs.push({
-      name: 'mp3', out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3',
-      args: [...inA(seek), ...limit, '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'],
-    });
-  } else if (acc.transcode) {
-    // Re-encode to H.264 + AAC. An automatic exact cut of a short clip favours speed
-    // (ultrafast is ~2× quicker at 1080p); the user-selected compatibility mode keeps
-    // the better-compressing preset.
-    const preset = acc.quickEncode ? 'ultrafast' : 'veryfast';
-    runs.push({
-      name: 'h264', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-      args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
-        '-c:v', 'libx264', '-preset', preset, '-crf', '20', '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', 'out.mp4'],
-    });
-  } else {
-    // Fast path: stream-copy the original tracks (VP9/Opus) into mp4 (seconds).
-    runs.push({
-      name: 'mp4-copy', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-      args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
-        '-c', 'copy', '-strict', '-2', ...ZERO, '-movflags', '+faststart', 'out.mp4'],
-    });
-    if (seek.length || limit.length) {
-      // If trimming upsets the copy path, keep the whole captured range rather than fail
-      // (it covers the fragment, just aligned to segment boundaries).
-      runs.push({
-        name: 'mp4-copy-untrimmed', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-        args: [...inV([]), ...inA([]), '-map', '0:v:0', '-map', '1:a:0',
-          '-c', 'copy', '-strict', '-2', '-avoid_negative_ts', 'make_zero',
-          '-movflags', '+faststart', 'out.mp4'],
-      });
-    }
-    // Last resort if mp4 refuses these codecs.
-    runs.push({
-      name: 'webm-copy', out: 'out.webm', type: 'video/webm', ext: '.webm',
-      args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
-        '-c', 'copy', ...ZERO, 'out.webm'],
-    });
-  }
+  // The run cascade (mp3 / h264 / mp4-copy ± untrimmed / webm-copy) and the seek/limit
+  // math live in lib/format.js (buildRuns) — it is unit-tested and identical in prod.
+  const runs = L.buildRuns({
+    isMp3, transcode: acc.transcode, quickEncode: acc.quickEncode,
+    trimStart, trimDuration, vName, aName,
+  });
 
   let data = null, chosen = null;
   const failures = [];
@@ -220,7 +150,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (seq < acc.seq) { sendResponse({ ok: true, duplicate: true }); return; }
         if (seq > acc.seq) { sendResponse({ ok: false, error: 'пропущен фрагмент данных' }); return; }
       }
-      acc[msg.track].push(b64decode(msg.b64));
+      acc[msg.track].push(L.b64decode(msg.b64));
       acc.seq++;
       sendResponse({ ok: true });
     } catch (e) {

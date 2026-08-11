@@ -17,7 +17,7 @@
     },
     {
       "matches": ["*://www.youtube.com/*"],
-      "js": ["content_ui.js"],
+      "js": ["lib/format.js", "content_ui.js"],
       "css": ["content_ui.css"],
       "run_at": "document_idle",
       "world": "ISOLATED",
