@@ -85,6 +85,12 @@ All code lives in `extension/`. The extension is split into three contexts commu
 - **Exact cuts ≤ 60s** (`EXACT_CUT_MAX_SEC` in `content_ui.js`) get a re-encode; longer
   fragments are stream-copied and start at the keyframe *before* the requested point (a note is
   shown in the toast). The copy path always uses `-avoid_negative_ts make_zero`.
+- **Resolution verification**: the modern ABR player can silently serve a lower resolution
+  even when `setPlaybackQualityRange('hd2160','hd2160')` is called. `playthrough()` re-applies
+  the quality while polling `video.videoHeight` against `RES_H` thresholds (up to ~16 s), and
+  temporarily enables theater mode (`setTheater`) to lift YouTube's viewport-size resolution
+  cap. The download reply carries the actually-served `height`; `content_ui.js` names the file
+  after the real resolution and toasts "плеер отдал Np вместо Mp" when downgraded.
 - **User must run an ad blocker (uBlock Origin)** — without it YouTube injects ad breaks into
   the media stream and capture fails. This is stated in the README as a hard requirement.
 - **Never retry `ytdl-finalize`** — a repeated finalize re-runs ffmpeg on already-freed data.

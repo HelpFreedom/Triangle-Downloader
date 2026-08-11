@@ -416,7 +416,13 @@
       });
 
       const ext = isMp3 ? '.mp3' : '.mp4';
-      const filename = safeName(info.title) + (isMp3 ? '' : ' [' + height + 'p]') +
+      // The player may serve a lower resolution than requested (ABR/viewport cap) —
+      // name the file after what we actually got so it isn't misleading, and note it
+      // in the toast below.
+      const actualH = result.height || 0;
+      const downgraded = !isMp3 && actualH >= 100 && actualH < height;
+      const effH = downgraded ? actualH : height;
+      const filename = safeName(info.title) + (isMp3 ? '' : ' [' + effH + 'p]') +
         (opts.partLabel || fragSuffix(start, end, duration)) + ext;
 
       // Capture starts at a segment boundary at or before `start`, so trimming must be
@@ -456,9 +462,10 @@
 
       if (!res || !res.ok) throw new Error(res && res.error || 'mux failed');
       const partialNote = result.complete === false ? ' — захват неполный, файл может быть обрезан' : '';
+      const resNote = downgraded ? ' — плеер отдал ' + actualH + 'p вместо ' + height + 'p' : '';
       t.set(prefix + 'Готово: ' + (res.filename || filename) +
-        (alignedStart ? ' — начало выровнено по опорному кадру' : '') + partialNote, 1);
-      t.hide(alignedStart || partialNote ? 7000 : 4000);
+        (alignedStart ? ' — начало выровнено по опорному кадру' : '') + partialNote + resNote, 1);
+      t.hide(alignedStart || partialNote || resNote ? 7000 : 4000);
       return { ok: true };
     } catch (err) {
       t.set(prefix + 'Ошибка: ' + (err.message || err), 1);

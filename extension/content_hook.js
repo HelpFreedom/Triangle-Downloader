@@ -150,14 +150,51 @@
 
   function setQualityRaw(q) {
     const p = player();
+    // Public API first...
     try { p.setPlaybackQualityRange && p.setPlaybackQualityRange(q, q); } catch (e) {}
     try { p.setPlaybackQuality && p.setPlaybackQuality(q); } catch (e) {}
+    // ...then whatever internal variants the player exposes (best-effort; modern builds
+    // sometimes only honour those). All wrapped — a bad probe must never break playback.
+    try {
+      const ia = p.getInternalApiInterface && p.getInternalApiInterface();
+      if (ia && ia.setPlaybackQualityRange) ia.setPlaybackQualityRange(q, q);
+    } catch (e) {}
+    try {
+      const ip = p.getInternalPlayer && p.getInternalPlayer();
+      if (ip && ip.setPlaybackQuality) ip.setPlaybackQuality(q);
+    } catch (e) {}
   }
   function availableHeights() {
     try {
       const map = { hd2160: 2160, hd1440: 1440, hd1080: 1080, hd720: 720, large: 480, medium: 360, small: 240 };
       return (player().getAvailableQualityLevels() || []).map(l => map[l]).filter(Boolean);
     } catch (e) { return []; }
+  }
+
+  // Expected minimum decoded height per requested quality. The player's ABR logic can
+  // silently serve a LOWER resolution even when a higher one is requested (a single
+  // setPlaybackQualityRange call is often ignored), so we verify with videoHeight and
+  // keep re-applying the quality until it sticks.
+  const RES_H = { hd2160: 2000, hd1440: 1300, hd1080: 1000, hd720: 700, medium: 300, small: 200, tiny: 100 };
+  function servedHeight() { try { return video().videoHeight || 0; } catch (e) { return 0; } }
+
+  // YouTube caps the served resolution by the rendered player size (viewport cap).
+  // Widening the player via theater mode lifts that cap for high-res captures.
+  function theaterState() {
+    try {
+      const b = document.querySelector('.ytp-size-button');
+      return b ? b.getAttribute('aria-pressed') === 'true' : null;
+    } catch (e) { return null; }
+  }
+  function setTheater(on) {
+    try {
+      const wf = document.querySelector('ytd-watch-flexy');
+      if (wf && wf.setTheaterModeRequested) { wf.setTheaterModeRequested(on); return; }
+    } catch (e) {}
+    try {
+      const b = document.querySelector('.ytp-size-button');
+      if (b && (b.getAttribute('aria-pressed') === 'true') !== !!on) b.click();
+    } catch (e) {}
   }
   // Seek via the player API, which also updates YouTube's app-level streaming
   // position — plain v.currentTime only moves the element, so the player would
@@ -202,9 +239,15 @@
     const capEnd = Math.min(opts.end && opts.end > 0 ? opts.end : dur, dur);
     const capStart = Math.max(0, Math.min(opts.start || 0, Math.max(0, capEnd - 1)));
     const capId = vidId();
+    // Resolution verification only matters for high-res targets (hd1440/hd2160), where
+    // the ABR player can silently serve less; 720p/1080p/mp3 reliably get what is asked.
+    const wantH = RES_H[targetQ] || 0;
+    const highRes = wantH > 700;
 
     const prev = { paused: v.paused, rate: v.playbackRate, time: v.currentTime, muted: v.muted };
+    const prevTheater = theaterState();
     keepAutoplayOff();
+    if (prevTheater === false && highRes) setTheater(true); // lift the viewport resolution cap
     try { v.muted = true; } catch (e) {}
     try { v.pause(); } catch (e) {}
 
@@ -226,9 +269,17 @@
     seekVia(capStart);
     await sleep(500);
 
-    // wait until the tracks we need have their init before entering the capture loop
+    // Wait until the tracks we need have their init AND the player is actually serving
+    // the requested resolution. A single quality call can be ignored by the modern ABR
+    // player, so keep re-applying it while waiting; if a fresh init arrives mid-setup
+    // (quality switch), appendBuffer restarts the track (see re-init handling), so any
+    // low-res lead-in is discarded automatically.
     const haveInits = () => store.tracks.audio && (!needVideo || store.tracks.video);
-    for (let i = 0; i < 40 && !haveInits(); i++) await sleep(150);
+    for (let i = 0; i < 80; i++) {
+      if (haveInits() && (!highRes || servedHeight() >= wantH)) break;
+      if (i % 2 === 0) setQualityRaw(targetQ);
+      await sleep(200);
+    }
 
     // Seek-driven capture — NO fast playback. The player buffers a window ahead
     // while paused, then plateaus; we hop the scrubber to the buffered edge to pull
@@ -255,6 +306,7 @@
     let capturedFrom = capStart;
     let cursor = capStart, stall = 0;
     let complete = false;
+    let actualH = 0;
     const span = Math.max(0.1, capEnd - capStart);
     const started = Date.now();
     try {
@@ -282,6 +334,7 @@
         if (Date.now() - started > 20 * 60 * 1000) break; // hard cap
       }
       capturedFrom = Math.min(capturedFrom, bufferedStartAt(capStart));
+      actualH = servedHeight(); // resolution the player actually served during capture
     } finally {
       store.capturing = false;
       // restore player state
@@ -289,10 +342,11 @@
       seekVia(prev.time);
       try { v.muted = prev.muted; } catch (e) {}
       keepAutoplayOff(); // leave autoplay disabled — don't turn it back on
+      if (typeof prevTheater === 'boolean' && theaterState() !== prevTheater) setTheater(prevTheater);
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
     onProgress(1);
-    return { capturedFrom: Math.max(0, capturedFrom), complete };
+    return { capturedFrom: Math.max(0, capturedFrom), complete, actualH: actualH || 0 };
   }
 
   // ---- subtitles (read from the built-in transcript panel) -----------------
@@ -501,6 +555,7 @@
           ok: true, done: true,
           complete: !!cap.complete,         // false when capture broke (stall/cap) — file may be cut
           capturedFrom: cap.capturedFrom,   // where the captured file actually begins
+          height: cap.actualH || 0,         // resolution the player actually served
           audio: { mime: aud.mime, size: aud.bytes.byteLength },
         };
         const transfers = [aud.bytes.buffer];
