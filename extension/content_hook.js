@@ -319,12 +319,37 @@
 
     // Force the requested quality BEFORE recording anything. The JS API is unreliable
     // for high-res (it can keep serving 720p), so select via the native settings menu —
-    // the same path a user clicks manually — and keep the API call as belt-and-braces.
-    // Re-applying the quality while capturing is dangerous: every switch re-inits the
-    // SourceBuffer and would CUT the recorded track. So all of it happens here, with
-    // recording off — any re-init merely refreshes lastInit.
+    // the same path a user clicks manually. Re-applying the quality while capturing is
+    // dangerous: every switch re-inits the SourceBuffer and would CUT the recorded track.
+    // So all of it happens here, with recording off — any re-init merely refreshes
+    // lastInit.
+    const qBefore = (() => { try { return player().getPlaybackQuality(); } catch (e) { return '?'; } })();
     const menuOk = highRes ? await menuSetQuality(wantRes) : false;
-    setQualityRaw(targetQ);
+    // CRITICAL: when the menu selection succeeded, do NOT call the JS quality API
+    // afterwards. setPlaybackQualityRange switches the player to AUTO (range) mode, which
+    // OVERRIDES the manual menu choice — ABR then serves the viewport-capped resolution
+    // (720p in a small window) and keeps re-adjusting quality during the capture (each
+    // switch re-inits the SourceBuffer and CUTS the recorded track, so the capture also
+    // reports incomplete). Verified on a live player: menu selects 1440p, but calling the
+    // API right after made the player serve 720p. The API is only a fallback when the
+    // menu was unreachable.
+    if (!menuOk) setQualityRaw(targetQ);
+    // If the menu interaction succeeded but the player's quality state did NOT change to
+    // the target (a click that registered in our code but not with the player), fall back
+    // to the JS API — otherwise the capture would sit at preQ's leftover 360p. Give the
+    // player a beat to register the selection first, so this check can't race and undo a
+    // WORKING menu choice. Accepts 60fps/HDR variants (startsWith) so those are not
+    // mistaken for a failed selection.
+    let qAfter = null;
+    if (highRes) {
+      await sleep(300);
+      qAfter = (() => { try { return player().getPlaybackQuality(); } catch (e) { return '?'; } })();
+      if (menuOk && qAfter !== '?' && !String(qAfter).startsWith(targetQ)) {
+        setQualityRaw(targetQ);
+        console.log('[YTDL] quality: menu ok but player reports', qAfter, '— falling back to API');
+      }
+    }
+    console.log('[YTDL] quality', { menuOk, before: qBefore, after: qAfter });
     // When the native menu couldn't be driven (menuOk false), the JS API alone rarely
     // lifts the resolution, so don't burn the full 16 s polling videoHeight — a short
     // re-apply window still covers the rare case where the API IS honoured, and the
@@ -332,7 +357,7 @@
     const verifyIter = highRes ? (menuOk ? 80 : 20) : 0;
     for (let i = 0; i < verifyIter; i++) {
       if (servedHeight() >= wantH) break;
-      if (i % 2 === 0) setQualityRaw(targetQ);
+      if (!menuOk && i % 2 === 0) setQualityRaw(targetQ);
       await sleep(200);
     }
 
@@ -463,10 +488,10 @@
     // the range is missing from the file — report honestly as incomplete.
     const restartCount = (store.restarts.video || 0) + (store.restarts.audio || 0);
     if (restartCount > 0) complete = false;
-    console.log('[YTDL] capture', {
-      menuOk, targetQ, requestedH: wantRes, servedH: actualH, complete, restarts: restartCount,
-      bytes: totalCaptured(),
-    });
+    // NOTE: restarts/bytes are logged as SEPARATE arguments because Chrome's console
+    // collapses an object into "{...}" when copied, hiding the values.
+    console.log('[YTDL] capture', { menuOk, targetQ, requestedH: wantRes, servedH: actualH, complete }, 'restarts:', restartCount, 'bytes:', totalCaptured());
+
     onProgress(1);
     return { capturedFrom: Math.max(0, capturedFrom), complete, actualH: actualH || 0, restarts: restartCount };
   }

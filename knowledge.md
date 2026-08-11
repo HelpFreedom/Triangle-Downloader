@@ -90,9 +90,17 @@ All code lives in `extension/`. The extension is split into three contexts commu
   (`RES_H[target] > 700`, i.e. 1440p/2160p) `playthrough()` selects the quality through the
   **native settings menu** (`menuSetQuality` — opens the gear, picks the exact "Np" entry,
   closes it on every exit path; the same path the user clicks manually, which the user
-  confirmed works), then re-applies the JS quality API while polling `video.videoHeight`
-  against `RES_H` thresholds (up to ~16 s) — ALL **before** recording starts, because
-  re-applying quality DURING capture would re-init the SourceBuffer and cut the track.
+  confirmed works), then polls `video.videoHeight` against `RES_H` thresholds (up to ~16 s)
+  — ALL **before** recording starts, because re-applying quality DURING capture would
+  re-init the SourceBuffer and cut the track.
+- **NEVER call the JS quality API after a successful menu selection** — this is the #1
+  high-res gotcha, confirmed live: `setPlaybackQualityRange` switches the player to AUTO
+  (range) mode, which overrides the manual menu choice (ABR serves viewport-capped 720p)
+  and keeps re-adjusting quality during capture (each switch re-inits the SourceBuffer and
+  CUTS the recorded track → `complete:false`). So `setQualityRaw(targetQ)` is called ONLY
+  when `menuSetQuality` returned false, and the verify loop never re-applies the API when
+  the menu succeeded. Diagnostics: `[YTDL] quality {menuOk, before, after}` logs
+  `getPlaybackQuality()` before/after.
   NO player layout is touched (no theater mode — `setTheaterModeRequested` toggles instead
   of setting, and it broke the user's wide layout). The download reply carries the
   actually-served `height`; `content_ui.js` names the file after the real resolution and
