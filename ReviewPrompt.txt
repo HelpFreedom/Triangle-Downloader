@@ -1,0 +1,80 @@
+Perform a full engineering code review of this entire project and automatically write what you find to new Audit.md.
+
+This is NOT only a security scan.
+I want a broad, senior-level code review and cleanup across the whole repo.
+
+Your goal is to improve:
+- correctness
+- code quality
+- logic consistency
+- maintainability
+- readability
+- robustness
+- test quality
+- architecture hygiene
+- error handling
+- typing and interface consistency
+- configuration consistency
+- dependency hygiene
+- security where relevant
+
+What to review:
+1.Bugs, broken logic, edge-case failures, incorrect assumptions, and fragile behaviour.
+2.Inconsistencies in code style, naming, abstractions, interfaces, return shapes, data handling, and conventions.
+3.Poor coding standards and bad practices for the language/framework used in the repo.
+4.Duplicated logic, over-complex code, dead code, unclear responsibilities, and confusing module boundaries.
+5.Missing validation, weak error handling, poor logging patterns, and unsafe defaults.
+6.Tests that are missing, weak, flaky, outdated, or inconsistent with the actual behaviour.
+7.Type issues, schema mismatches, null handling problems, and contract inconsistencies between modules.
+8.Config, CI/CD, Docker, infra, and dependency issues where they affect reliability, maintainability, or correctness.
+9.Security vulnerabilities too, but as one part of the review — not the only focus.
+10.Suggestions for code refactoring, if necessary to comply with the instructions in this request.
+
+How to work:
+
+1.Commit all changes first, then ispect the whole repository structure first.
+2.Identify the main languages, frameworks, package managers, test tools, linters, type checkers, formatters, and build tools.
+3.Infer the repository’s coding patterns and intended architecture before changing code.
+4.Run all existing validation commands where available:
+   - tests
+   - lint
+   - type checks
+   - build
+   - static analysis
+
+5. Review the codebase holistically, not file-by-file in isolation.
+6. Automatically write to Audit.md the issues you find.
+7. Suggest fix and improvements. Prefer minimal, safe, production-ready changes.
+8. Preserve existing intended behaviour unless the behaviour is clearly broken, inconsistent, unsafe, or low quality.
+9. Add or update tests where needed to lock in important fixes.
+10. Don't rely on assumptions; read the actual code. Before suggesting changes, develop specific solutions. Assess their consequences holistically, ensure you have found the best solutions, and verify that they will not lead to errors, performance degradation, or loss of functionality. Continue improving until no further safe, high-confidence fixes are obvious.
+
+Review standard:
+- Act like a meticulous principal engineer performing a real repository-wide review.
+- Don't change anything in the code. Do not stop at reporting; Prepare specific fixes and provide a detailed description in Audut.md of the issues found and their solutions, including examples of ready-to-use code.
+- Do not focus only on security.
+- Prioritise correctness and logic first, then consistency and maintainability, then standards and cleanup.
+- Avoid cosmetic-only refactors unless they materially improve clarity, consistency, or defect risk.
+- Avoid speculative rewrites when evidence is weak.
+- When several patterns exist in the repo, standardise toward the cleaner and more maintainable one when safe.
+
+Pay special attention to:
+- inconsistent naming and unclear intent
+- mismatched data models and implicit assumptions
+- repeated logic that should be centralised
+- brittle conditionals and edge cases
+- partial error handling
+- poor separation of concerns
+- hidden side effects
+- confusing public APIs
+- test gaps around critical logic
+- drift between code, config, and tests
+- places where the implementation contradicts the apparent intent
+
+At the end, return:
+
+1.A detailed Audit.md document describing the issues found, their fixes, the rationale behind those solutions, and other necessary information, enabling a junior developer to begin making fixes without having to re-examine the entire codebase.
+
+2.remaining concerns not safely fixable automatically
+
+3.assumptions made

@@ -10,7 +10,8 @@ No `yt-dlp`, no third‑party sites or servers: everything runs locally in your 
 
 ## Features
 
-- **Video** — 720p / 1080p as `.mp4` (video + audio).
+- **Video** — 720p / 1080p / 1440p / 2160p as `.mp4` (video + audio; 1440p and 2160p are
+  shown only when the video actually supports them).
 - **Audio** — `.mp3` (audio track only).
 - **Clip selection** — "start — end" fields in the menu (default `0:00:00` … full length).
   **Only the selected range is fetched**, not the whole video: e.g. 10 seconds out of an
@@ -50,7 +51,7 @@ No `yt-dlp`, no third‑party sites or servers: everything runs locally in your 
 1. Click the ▽ button in the player to open the menu.
 2. Optionally set the **start** and **end** of a clip (defaults to the whole video).
 3. Choose what to download:
-   - **Video** → `1080p` or `720p`;
+   - **Video** → `2160p`, `1440p`, `1080p` or `720p` (whichever are available);
    - **Audio** → `MP3`;
    - **Subtitles** → `.txt`.
 4. For video you can switch the **Format**: "Fast" (default) or "H.264".
@@ -78,6 +79,9 @@ extension hooks in where the data has already been decrypted and split into trac
 
 - Capture works by seeking through the buffer, so for very long videos it takes time
   proportional to the length.
+- 1440p and 2160p are offered only when the video supports them. Files at those resolutions
+  are huge: capture and muxing need lots of memory and time, and long 4K videos may hit the
+  capture limits — prefer downloading fragments for 4K.
 - "H.264" and `.mp3` re‑encode via `ffmpeg.wasm` (single‑threaded), which is noticeably slower
   than the fast remux — up to a few minutes on long videos.
 - In "Fast" mode the `.mp4` contains VP9/Opus codecs — it plays in Chrome, VLC and modern

@@ -127,7 +127,8 @@
   // ---- player helpers ------------------------------------------------------
   function player() { return document.getElementById('movie_player'); }
   function video() { return document.querySelector('video'); }
-  const Q = { 1080: 'hd1080', 720: 'hd720' };
+  // quality name per capture height — YouTube's setPlaybackQuality keys
+  const Q = { 2160: 'hd2160', 1440: 'hd1440', 1080: 'hd1080', 720: 'hd720' };
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   function setQualityRaw(q) {

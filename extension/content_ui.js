@@ -106,7 +106,9 @@
     if (menuEl) { closeMenu(); return; }
     const info = await callHook('info');
     const duration = Math.floor(info.duration || 0);
-    const heights = (info.heights || []).filter((h) => h === 1080 || h === 720);
+    // 1440p/2160p appear only when the player reports them; 1080p/720p stay
+    // always-visible best-effort options (legacy behaviour).
+    const heights = (info.heights || []).filter((h) => h === 2160 || h === 1440 || h === 1080 || h === 720);
     if (!heights.includes(1080)) heights.unshift(1080);
     if (!heights.includes(720)) heights.push(720);
     const uniq = [...new Set(heights)].sort((a, b) => b - a);
