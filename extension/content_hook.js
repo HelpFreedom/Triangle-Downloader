@@ -73,6 +73,14 @@
     if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     return null;
   }
+  // Byte-identical init segments mean the player re-appended the SAME stream (e.g. a
+  // buffer-eviction recovery) — the media before and after is contiguous and the same
+  // codec, so the track can be glued. A different init means a real quality switch.
+  function sameBytes(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
 
   // Does this appended chunk begin a fresh track file? A valid concatenation must
   // start at the init segment, so we only begin recording a track from the chunk
@@ -111,23 +119,47 @@
           if (init) store.lastInit[kind] = { bytes: u8.slice(), mime: this.__ytdlMime || '' };
           if (store.capturing) {
             if (init) {
-              // A fresh init mid-capture means the player cleared its buffer and
-              // restarted (remove() + new init). Everything before is no longer
-              // contiguous, so start the track over at the new init instead of
-              // gluing two init segments together (which would corrupt the file).
-              // If the track already had data, the restart CUT it short — count it so
-              // the result is honestly reported as incomplete.
-              if (store.tracks[kind]) {
-                store.restarts[kind] = (store.restarts[kind] || 0) + 1;
+              const t = store.tracks[kind];
+              if (t && t.parts.length) {
+                // A fresh init mid-capture means the player cleared its buffer and
+                // restarted (remove() + new init). This is usually a buffer-eviction
+                // recovery at the SAME quality (the quality is never re-applied during
+                // capture), NOT a quality switch. When the new init is byte-identical
+                // to the track's own init, the stream before and after the reset is the
+                // same codec and contiguous in time — so we DROP the redundant init and
+                // keep appending, and the captured file stays whole (a seam, not a cut).
+                // A DIFFERENT init means a real quality switch: the streams can't be
+                // glued, so the track starts over (CUT) and it is counted so the result
+                // is honestly reported as incomplete.
+                if (sameBytes(u8, t.initBytes)) {
+                  t.seams = (t.seams || 0) + 1;
+                  dbg('capture re-init', kind, 'same-stream — glued (seam)', t.seams, 'bytes', totalCaptured());
+                } else {
+                  // A DIFFERENT-stream re-init (real quality switch). At the very START
+                  // of the capture it is usually the tail of OUR OWN target-quality
+                  // switch still settling — the replacement track re-covers the whole
+                  // range, so it must NOT be counted as a cut (it produced a false
+                  // "файл может быть обрезан" message on complete files). Only a
+                  // re-init well into the capture actually shortens the file.
+                  const nearStart = Math.abs((store.cursor || 0) - (store.capStart || 0)) < 2;
+                  if (!nearStart) store.restarts[kind] = (store.restarts[kind] || 0) + 1;
+                  store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [u8.slice()], initBytes: u8.slice() };
+                  dbg('capture re-init', kind, nearStart ? 'start-of-capture — replaced, not counted' : ('DIFFERENT stream — track cut (restart) ' + (store.restarts[kind] || 1)));
+                }
+              } else {
+                store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [u8.slice()], initBytes: u8.slice() };
               }
-              store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [u8.slice()] };
             } else {
               const t = store.tracks[kind];
               if (t) {
                 t.parts.push(u8.slice());
               } else if (store.lastInit[kind]) {
                 // media arrived without a fresh init → seed the track with the stored init
-                store.tracks[kind] = { mime: store.lastInit[kind].mime, parts: [store.lastInit[kind].bytes, u8.slice()] };
+                store.tracks[kind] = {
+                  mime: store.lastInit[kind].mime,
+                  parts: [store.lastInit[kind].bytes, u8.slice()],
+                  initBytes: store.lastInit[kind].bytes,
+                };
               }
               // else: no init available yet — skip until one appears
             }
@@ -167,21 +199,13 @@
   const Q = { 2160: 'hd2160', 1440: 'hd1440', 1080: 'hd1080', 720: 'hd720' };
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  function setQualityRaw(q) {
-    const p = player();
-    // Public API first...
-    try { p.setPlaybackQualityRange && p.setPlaybackQualityRange(q, q); } catch (e) {}
-    try { p.setPlaybackQuality && p.setPlaybackQuality(q); } catch (e) {}
-    // ...then whatever internal variants the player exposes (best-effort; modern builds
-    // sometimes only honour those). All wrapped — a bad probe must never break playback.
-    try {
-      const ia = p.getInternalApiInterface && p.getInternalApiInterface();
-      if (ia && ia.setPlaybackQualityRange) ia.setPlaybackQualityRange(q, q);
-    } catch (e) {}
-    try {
-      const ip = p.getInternalPlayer && p.getInternalPlayer();
-      if (ip && ip.setPlaybackQuality) ip.setPlaybackQuality(q);
-    } catch (e) {}
+  // The LOWEST quality available in the player — the pre-capture flush target. (The JS
+  // quality API — both setPlaybackQualityRange and setPlaybackQuality — is IGNORED by
+  // the SABR player for switching quality, which is why downloads used to require setting
+  // the resolution by hand; the native settings menu is the ONLY reliable switch.)
+  function lowestAvailableHeight() {
+    const hs = availableHeights();
+    return hs.length ? Math.min.apply(null, hs) : 0;
   }
   function availableHeights() {
     try {
@@ -190,30 +214,31 @@
     } catch (e) { return []; }
   }
 
-  // Expected minimum decoded height per requested quality. The player's ABR logic can
-  // silently serve a LOWER resolution even when a higher one is requested (a single
-  // setPlaybackQualityRange call is often ignored), so we verify with videoHeight and
-  // keep re-applying the quality until it sticks.
+  // Expected minimum decoded height per requested quality — the lower bound of the
+  // settled band used by forceQuality (the upper bound is RES_NAME + 150). The ABR
+  // player can silently serve a LOWER resolution than requested, so we verify the
+  // actually decoded videoHeight and re-apply until it sticks (see forceQuality).
   const RES_H = { hd2160: 2000, hd1440: 1300, hd1080: 1000, hd720: 700, medium: 300, small: 200, tiny: 100 };
   // Actual resolution height per quality key — what the native menu labels items with
   // ("1440p"/"2160p"). menuSetQuality matches menu text against THIS, not RES_H (a
   // verification threshold).
-  const RES_NAME = { hd2160: 2160, hd1440: 1440, hd1080: 1080, hd720: 720, medium: 360, small: 240, tiny: 144 };
+  const RES_NAME = { hd2160: 2160, hd1440: 1440, hd1080: 1080, hd720: 720, large: 480, medium: 360, small: 240, tiny: 144 };
   function servedHeight() { try { return video().videoHeight || 0; } catch (e) { return 0; } }
 
-  // Force the quality the way the user does it: through the native settings menu. The JS
-  // quality API (setPlaybackQualityRange) is unreliable in the SABR player and can keep
-  // silently serving 720p, but the menu path always works. Best-effort: returns true when
-  // the target was selected, false when the menu wasn't reachable. NO state toggles here —
-  // we only ever open the menu, pick a quality, and close it (the user's layout is left
-  // exactly as it was).
+  // Force the quality the way the user does it: through the native settings menu — the
+  // ONLY reliable quality switcher in the SABR player (the JS API, fixed or range, is
+  // ignored for switching: users had to set the resolution by hand for downloads to
+  // work). `sel` is a numeric height (e.g. 1440) or the string 'auto' (re-selects
+  // "Автоматически"). Best-effort: returns true when the target was selected, false when
+  // the menu wasn't reachable. NO state toggles here — we only ever open the menu, pick a
+  // quality, and close it (the user's layout is left exactly as it was).
   function menuItemLabel(it) {
     try {
       const l = it.querySelector('.ytp-menuitem-label') || it.querySelector('.ytp-menuitem-title') || it;
       return (l.textContent || '').trim();
     } catch (e) { return ''; }
   }
-  async function menuSetQuality(wantH) {
+  async function menuSetQuality(sel) {
     const gear = document.querySelector('.ytp-settings-button');
     if (!gear) { dbg('menuSetQuality: no gear button'); return false; }
     const isOpen = () => {
@@ -238,23 +263,88 @@
       qItem.click();
       let qItems = [];
       for (let i = 0; i < 25; i++) {
-        qItems = items().filter(it => /^\d{3,4}p/i.test(menuItemLabel(it)));
+        qItems = items().filter(it => /^\d{3,4}p/i.test(menuItemLabel(it)) || /автоматически|auto/i.test(menuItemLabel(it)));
         if (qItems.length) break;
         await sleep(150);
       }
       if (!qItems.length) { closeIfOpen(); dbg('menuSetQuality: no visible quality items'); return false; }
-      // Prefer the exact "1440p" entry over "1440p60"; accept any variant that starts
-      // with the target height (labels normalize to digits: "1440p60" → "144060").
+      if (sel === 'auto') {
+        const autoItem = qItems.find(it => /автоматически|auto/i.test(menuItemLabel(it)));
+        if (!autoItem) { closeIfOpen(); dbg('menuSetQuality: no auto entry'); return false; }
+        autoItem.click();
+        await sleep(250);
+        closeIfOpen();
+        dbg('menuSetQuality: selected auto');
+        return true;
+      }
+      // Prefer the PLAIN entry ("1080p") over "1080p Premium" — the Premium variant is
+      // subscription-gated and selecting it when unavailable fails — and over
+      // "1080p60". Accept any variant that starts with the target height (labels
+      // normalize to digits: "1080p60" → "108060"). Premium is only a last resort
+      // (subscribers with no plain entry at that height).
       const norm = (t) => String(t).replace(/[^0-9]/g, '');
-      const target = qItems.filter(it => norm(menuItemLabel(it)) === String(wantH))[0]
-                  || qItems.filter(it => norm(menuItemLabel(it)).startsWith(String(wantH)))[0];
-      if (!target) { closeIfOpen(); dbg('menuSetQuality: no entry for', wantH, qItems.map(menuItemLabel)); return false; }
+      const label = (it) => menuItemLabel(it);
+      const plain = qItems.filter(it => !/premium|премиум/i.test(label(it)));
+      const exact = plain.filter(it => norm(label(it)) === String(sel))[0];
+      const target = exact
+                  || plain.filter(it => norm(label(it)).startsWith(String(sel)))[0]
+                  || qItems.filter(it => norm(label(it)) === String(sel))[0]
+                  || qItems.filter(it => norm(label(it)).startsWith(String(sel)))[0];
+      if (!target) { closeIfOpen(); dbg('menuSetQuality: no entry for', sel, qItems.map(menuItemLabel)); return false; }
       target.click();
       await sleep(250);
       closeIfOpen(); // the menu may auto-close on selection; close it if it didn't
-      dbg('menuSetQuality: selected', wantH);
+      dbg('menuSetQuality: selected', sel);
       return true;
     } catch (e) { closeIfOpen(); dbg('menuSetQuality exception:', e); return false; }
+  }
+  // Select the requested quality via the NATIVE settings menu — the only reliable quality
+  // switcher in the SABR player (the JS API, fixed or range, is ignored for switching:
+  // that is why downloads used to require setting the resolution by hand) — and confirm
+  // the player actually serves it, ALL before recording starts (any switch during capture
+  // re-inits the SourceBuffer and cuts the track; same-stream re-inits are glued as seams).
+  // "Settled" means the decoded frame height is inside the band [wantH, wantRes + 150]:
+  // waiting on BOTH sides — the height must RISE for an upgrade AND FALL for a downgrade —
+  // so the switch has fully completed before recording. Video targets that can't be
+  // confirmed within ~12 s abort with a clear error (an honest failure beats a mislabelled
+  // file); mp3 is best-effort (only audio is used — the video is just capped to save RAM).
+  async function forceQuality(wantRes, wantH, needVideo) {
+    const qBefore = (() => { try { return player().getPlaybackQuality(); } catch (e) { return '?'; } })();
+    const settled = () => {
+      const h = servedHeight();
+      return h >= wantH && h <= wantRes + 150;
+    };
+    if (!await menuSetQuality(wantRes)) {
+      await sleep(400);
+      if (!await menuSetQuality(wantRes)) {
+        dbg('quality: menu unreachable — cannot switch');
+        if (needVideo && !settled()) {
+          throw new Error('не удалось переключить плеер на ' + wantRes + 'p — меню качества недоступно, установите ' + wantRes + 'p вручную и повторите');
+        }
+        return;
+      }
+    }
+    const iter = needVideo ? 60 : 25;
+    for (let i = 0; i < iter && !settled(); i++) {
+      if (i === Math.floor(iter / 2)) await menuSetQuality(wantRes); // re-select mid-way, still pre-recording
+      await sleep(200);
+    }
+    dbg('quality', { before: qBefore, after: (() => { try { return player().getPlaybackQuality(); } catch (e) { return '?'; } })(), served: servedHeight() });
+    if (needVideo && !settled()) {
+      throw new Error('не удалось переключить плеер на ' + wantRes + 'p (плеер отдаёт ' +
+        (servedHeight() || '?') + 'p) — установите ' + wantRes + 'p вручную в плеере и повторите');
+    }
+  }
+  // Restore the user's pre-download quality after the capture (the capture left the
+  // player at the requested resolution). Best-effort through the native menu — the only
+  // reliable switch; 'auto' re-selects "Автоматически". Never throws.
+  async function restoreQuality(prevKey) {
+    if (!prevKey || prevKey === '?' || prevKey === 'null') return;
+    try {
+      if (/^auto/i.test(prevKey)) { await menuSetQuality('auto'); return; }
+      const h = RES_NAME[prevKey];
+      if (h) await menuSetQuality(h);
+    } catch (e) { dbg('restoreQuality:', e); }
   }
   // Seek via the player API, which also updates YouTube's app-level streaming
   // position — plain v.currentTime only moves the element, so the player would
@@ -290,8 +380,7 @@
   // (never triggering the end / autoplay-next) and just wait for the buffer to
   // cover the whole duration. Capture aborts if the page navigates to another video.
   async function playthrough(opts, onProgress) {
-    const targetQ = opts.targetQ;   // e.g. 'hd1080' / 'small'
-    const preQ = opts.preQ;         // a DIFFERENT low quality, to force a fresh init
+    const targetQ = opts.targetQ;   // e.g. 'hd1080' / 'medium' (mp3)
     const needVideo = opts.needVideo !== false; // mp3 only needs audio
     const v = video();
     const dur = v.duration;
@@ -299,73 +388,68 @@
     const capEnd = Math.min(opts.end && opts.end > 0 ? opts.end : dur, dur);
     const capStart = Math.max(0, Math.min(opts.start || 0, Math.max(0, capEnd - 1)));
     const capId = vidId();
-    // Resolution verification only matters for high-res targets (hd1440/hd2160), where
-    // the ABR player can silently serve less; 720p/1080p/mp3 reliably get what is asked.
-    const wantH = RES_H[targetQ] || 0;       // verification threshold for the videoHeight poll
-    const wantRes = RES_NAME[targetQ] || 0;  // menu label height — what menuSetQuality must match
-    const highRes = wantRes >= 1440;         // only 1440p/2160p need the menu dance
+    // Verification band for the served height: [wantH, wantRes + 150]. ALL qualities go
+    // through the native menu (the JS API cannot switch quality in the SABR player).
+    const wantH = RES_H[targetQ] || 0;       // lower bound of the served-height band
+    const wantRes = RES_NAME[targetQ] || 0;  // requested height — the band centre / menu label
 
     const prev = { paused: v.paused, rate: v.playbackRate, time: v.currentTime, muted: v.muted };
+    // Remember the user's current quality so it can be restored when the capture ends
+    // (the capture switches the player to the requested resolution).
+    const prevKey = (() => { try { return player().getPlaybackQuality(); } catch (e) { return null; } })();
     keepAutoplayOff();
     try { v.muted = true; } catch (e) {}
     try { v.pause(); } catch (e) {}
 
-    // Order matters:
-    //  1) switch to a low quality and seek to a position clearly DIFFERENT from
-    //     capStart, so that seeking to capStart afterwards is a real jump. That jump
-    //     forces BOTH tracks to re-fetch — important because the audio itag is the
-    //     same Opus at every quality, so a quality switch alone won't re-init audio.
-    //  2) force the target quality and VERIFY the player actually serves it — all
-    //     while recording is still OFF — and only then start recording and seek to
-    //     capStart. Capture begins at the requested fragment, not the video's start.
-    const preSeek = capStart > 10 ? 0 : Math.min(35, Math.max(1, dur - 5));
-    setQualityRaw(preQ);
-    await sleep(500);
-    seekVia(preSeek);
-    await sleep(700);
-
-    // Force the requested quality BEFORE recording anything. The JS API is unreliable
-    // for high-res (it can keep serving 720p), so select via the native settings menu —
-    // the same path a user clicks manually. Re-applying the quality while capturing is
-    // dangerous: every switch re-inits the SourceBuffer and would CUT the recorded track.
-    // So all of it happens here, with recording off — any re-init merely refreshes
-    // lastInit.
-    const qBefore = (() => { try { return player().getPlaybackQuality(); } catch (e) { return '?'; } })();
-    const menuOk = highRes ? await menuSetQuality(wantRes) : false;
-    // CRITICAL: when the menu selection succeeded, do NOT call the JS quality API
-    // afterwards. setPlaybackQualityRange switches the player to AUTO (range) mode, which
-    // OVERRIDES the manual menu choice — ABR then serves the viewport-capped resolution
-    // (720p in a small window) and keeps re-adjusting quality during the capture (each
-    // switch re-inits the SourceBuffer and CUTS the recorded track, so the capture also
-    // reports incomplete). Verified on a live player: menu selects 1440p, but calling the
-    // API right after made the player serve 720p. The API is only a fallback when the
-    // menu was unreachable.
-    if (!menuOk) setQualityRaw(targetQ);
-    // If the menu interaction succeeded but the player's quality state did NOT change to
-    // the target (a click that registered in our code but not with the player), fall back
-    // to the JS API — otherwise the capture would sit at preQ's leftover 360p. Give the
-    // player a beat to register the selection first, so this check can't race and undo a
-    // WORKING menu choice. Accepts 60fps/HDR variants (startsWith) so those are not
-    // mistaken for a failed selection.
-    let qAfter = null;
-    if (highRes) {
-      await sleep(300);
-      qAfter = (() => { try { return player().getPlaybackQuality(); } catch (e) { return '?'; } })();
-      if (menuOk && qAfter !== '?' && !String(qAfter).startsWith(targetQ)) {
-        setQualityRaw(targetQ);
-        dbg('quality: menu ok but player reports', qAfter, '— falling back to API');
+    // Order matters — every quality change happens through the native settings menu, the
+    // only reliable switcher in the SABR player (the JS API, fixed or range, is ignored):
+    //  1) FLUSH: switch to the LOWEST available quality. That forces the player to
+    //     re-fetch fresh segments at a DIFFERENT itag, evicting any stale buffer that
+    //     could cover capStart — without it, a video already playing at the requested
+    //     quality would keep its buffer, the later seek to capStart would not be a real
+    //     jump, and the capture would never see a fresh init ("не удалось захватить
+    //     аудио"). Best-effort: if the menu can't be driven we continue anyway.
+    //  2) seek to a position clearly DIFFERENT from capStart (a real jump also re-inits
+    //     AUDIO, whose itag is the same Opus at every quality — only a position change
+    //     re-fetches it), then select the target quality and VERIFY the player actually
+    //     serves it — all while recording is still OFF — and only then start recording
+    //     and seek to capStart. Capture begins at the requested fragment, not the video's
+    //     start.
+    const preSeek = capStart > 10 ? (dur - 5 > 10 ? dur - 5 : 0) : Math.min(35, Math.max(1, dur - 5));
+    try {
+      // The flush (switch to the lowest quality) is only needed when the player is ALREADY
+      // at the requested quality — then the target switch below would be a no-op and the
+      // stale buffer would survive. When the current quality differs, the target switch
+      // itself re-fetches at a different itag and evicts the old buffer, so the flush
+      // dance is skipped (it visibly delayed every download).
+      const flushNeeded = !prevKey || prevKey === '?' || prevKey === targetQ;
+      const lowH = flushNeeded ? lowestAvailableHeight() : 0;
+      if (lowH) {
+        try { await menuSetQuality(lowH); } catch (e) {}
+        await sleep(500); // let the flush switch start (recording is still OFF)
       }
-    }
-    dbg('quality', { menuOk, before: qBefore, after: qAfter });
-    // When the native menu couldn't be driven (menuOk false), the JS API alone rarely
-    // lifts the resolution, so don't burn the full 16 s polling videoHeight — a short
-    // re-apply window still covers the rare case where the API IS honoured, and the
-    // honest actualH report remains the safety net.
-    const verifyIter = highRes ? (menuOk ? 80 : 20) : 0;
-    for (let i = 0; i < verifyIter; i++) {
-      if (servedHeight() >= wantH) break;
-      if (!menuOk && i % 2 === 0) setQualityRaw(targetQ);
-      await sleep(200);
+      seekVia(preSeek);
+      await sleep(700);
+
+      // Select the requested quality BEFORE recording anything and verify the player
+      // actually serves it — via the native settings menu (the same path the user clicks
+      // manually). From here on the quality is NEVER touched again — any switch
+      // mid-recording re-inits the SourceBuffer and CUTS the recorded track (same-stream
+      // re-inits are glued as seams; different-stream ones are counted as restarts and
+      // reported as partial). forceQuality throws a clear error when the requested
+      // quality can't be confirmed — a capture that starts at the wrong resolution would
+      // produce a mislabelled file, which is worse than an honest failure.
+      await forceQuality(wantRes, wantH, needVideo);
+    } catch (e) {
+      // Restore the player state on a PRE-recording failure (the capture loop below has
+      // its own finally): an unconfirmed quality must not leave the player muted or stuck
+      // at a different position. The error propagates to the bridge as a clear message.
+      try { v.playbackRate = prev.rate; } catch (err) {}
+      seekVia(prev.time);
+      try { v.muted = prev.muted; } catch (err) {}
+      await restoreQuality(prevKey); // the flush already changed the quality
+      if (!prev.paused) { try { v.play(); } catch (err) {} }
+      throw e;
     }
 
     resetTracks();
@@ -374,6 +458,11 @@
     // them would blind trackEdge() and the per-track capture loop would fall back to the
     // union edge (the very freeze bug we're fixing).
     store.restarts = Object.create(null);
+    // Capture context for the appendBuffer patch: a re-init arriving within ~2 s of the
+    // start is our own quality switch settling (harmless), later ones are real cuts.
+    store.capStart = capStart;
+    store.capEnd = capEnd;
+    store.cursor = capStart;
     store.capturing = true;
     seekVia(capStart);
     await sleep(500);
@@ -427,6 +516,7 @@
     let cursor = capStart, stall = 0;
     let complete = false;
     let actualH = 0;
+    let seamCount = 0;           // same-stream re-inits glued into the track (not cuts)
     const span = Math.max(0.1, capEnd - capStart);
     const started = Date.now();
     try {
@@ -452,6 +542,7 @@
 
         if (edge > cursor + 0.3) {                       // window extended → hop to the edge
           cursor = edge;
+          store.cursor = cursor; // keep the patch aware of the playhead for restart classification
           seekVia(Math.min(cursor, capEnd - 0.1));
           stall = 0;
         } else {                                         // plateaued → nudge to re-trigger fetch
@@ -463,13 +554,16 @@
       }
       capturedFrom = Math.min(capturedFrom, bufferedStartAt(capStart));
       actualH = servedHeight(); // resolution the player actually served during capture
-      // Buffer-eviction guard: if the browser evicted the START of the buffered range
-      // (memory pressure), the per-track edges can still reach capEnd while the captured
-      // track is missing [capStart, evictPoint] — no init involved, so no restart was
-      // counted, and a full-video download skips trimming → would silently ship a short
-      // file. Completing therefore also requires the video buffer to still cover the
-      // capture start.
-      if (complete && needVideo) {
+      seamCount = ((store.tracks.video && store.tracks.video.seams) || 0) +
+                  ((store.tracks.audio && store.tracks.audio.seams) || 0);
+      // Buffer-eviction guard: only meaningful when the capture had NO mid-capture
+      // re-inits. If the browser evicted the START of the buffered range and the player
+      // re-fetched WITHOUT re-initing, the re-fetched bytes duplicate already-captured
+      // data and a full-video download (no trimming) would silently ship a corrupt file —
+      // so complete only when the video buffer still covers the capture start. A
+      // same-stream re-init (seam) is glued and keeps the bytes whole; a different-stream
+      // re-init is counted as a restart below and already forces incomplete.
+      if (complete && needVideo && seamCount === 0) {
         try {
           const sb = store.sb.video;
           if (sb) {
@@ -489,18 +583,21 @@
       seekVia(prev.time);
       try { v.muted = prev.muted; } catch (e) {}
       keepAutoplayOff(); // leave autoplay disabled — don't turn it back on
+      // restore the user's pre-download quality (the capture left it at the target)
+      await restoreQuality(prevKey);
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
     // A mid-capture re-init (quality switch / buffer flush) REPLACED a track, so part of
-    // the range is missing from the file — report honestly as incomplete.
+    // the range is missing from the file — report honestly as incomplete. Same-stream
+    // re-inits (seams) were glued and do NOT cut the file.
     const restartCount = (store.restarts.video || 0) + (store.restarts.audio || 0);
     if (restartCount > 0) complete = false;
     // NOTE: restarts/bytes are logged as SEPARATE arguments because Chrome's console
     // collapses an object into "{...}" when copied, hiding the values.
-    dbg('capture', { menuOk, targetQ, requestedH: wantRes, servedH: actualH, complete }, 'restarts:', restartCount, 'bytes:', totalCaptured());
+    dbg('capture', { targetQ, requestedH: wantRes, servedH: actualH, complete, seams: seamCount }, 'restarts:', restartCount, 'bytes:', totalCaptured());
 
     onProgress(1);
-    return { capturedFrom: Math.max(0, capturedFrom), complete, actualH: actualH || 0, restarts: restartCount };
+    return { capturedFrom: Math.max(0, capturedFrom), complete, actualH: actualH || 0, restarts: restartCount, seams: seamCount };
   }
 
   // ---- subtitles (read from the built-in transcript panel) -----------------
@@ -698,9 +795,8 @@
         // mp3 only needs audio → capture at a low but still-adaptive video quality
         // (360p) to save bandwidth while keeping video/audio as separate tracks.
         const targetQ = isMp3 ? 'medium' : (Q[height] || 'hd720');
-        const preQ = (targetQ === 'small' || targetQ === 'tiny' || targetQ === 'medium') ? 'tiny' : 'medium';
         const cap = await playthrough(
-          { targetQ, preQ, start: s, end: e, needVideo: !isMp3 },
+          { targetQ, start: s, end: e, needVideo: !isMp3 },
           (pct) => reply({ progress: pct, phase: 'buffering' }));
 
         const aud = assemble('audio');
