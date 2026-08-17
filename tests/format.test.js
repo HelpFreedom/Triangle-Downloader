@@ -209,6 +209,18 @@ test('safeName strips illegal filename characters and caps length', () => {
   assert.equal(L.safeName('x'.repeat(200)).length, 120);
 });
 
+test('safeName strips invisible format/control chars Chrome rejects ("Invalid filename")', () => {
+  // U+2060 WORD JOINER — exactly what the failing title wraps its text in
+  assert.equal(L.safeName('\u2060Masha x Maria Spichers - Otra noche (Video Oficial)\u2060'),
+    'Masha x Maria Spichers - Otra noche (Video Oficial)');
+  assert.equal(L.safeName('\u200bzero\u200b width\u200b'), 'zero width');
+  assert.equal(L.safeName('\ufeffBOM'), 'BOM');
+  assert.equal(L.safeName('\u00adsoft\u00ad hyphen'), 'soft hyphen');
+  assert.equal(L.safeName('tab\there'), 'tabhere'); // control chars are deleted
+  assert.equal(L.safeName('trailing. '), 'trailing');
+  assert.equal(L.safeName('\u2060\u2060'), 'video'); // all-invisible title falls back
+});
+
 test('fragSuffix only adds a suffix for real fragments', () => {
   assert.equal(L.fragSuffix(0, 3600, 3600), '');
   assert.equal(L.fragSuffix(0, 3599.6, 3600), ''); // within the 0.5s tolerance

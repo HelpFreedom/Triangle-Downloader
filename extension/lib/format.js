@@ -62,7 +62,17 @@
 
   // ---- filenames -----------------------------------------------------------
   function safeName(s) {
-    return (s || 'video').replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+    return (s || 'video')
+      // chrome.downloads rejects filenames containing control (Cc) or format (Cf)
+      // characters — e.g. U+2060 WORD JOINER / zero-width spaces that some YouTube
+      // titles embed so they can't be copied ("Invalid filename" from Chrome).
+      .replace(/[\u0000-\u001f\u007f-\u009f\u00ad\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+/g, '')
+      .replace(/[\\/:*?"<>|]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      // Chrome/Windows also reject names ending in a dot or a space.
+      .replace(/[. ]+$/, '')
+      .slice(0, 120) || 'video';
   }
   function fragSuffix(start, end, duration) {
     if (start <= 0 && end >= duration - 0.5) return '';
