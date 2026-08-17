@@ -285,7 +285,13 @@
     const p = player();
     let pr = null;
     try { pr = p.getPlayerResponse(); } catch (e) {}
-    if (!pr || !pr.captions) pr = window.ytInitialPlayerResponse;
+    // ytInitialPlayerResponse is NOT refreshed on in-site navigation — it still holds
+    // the video the tab was opened with, so only trust it when it matches this video.
+    if (!pr || !pr.captions) {
+      const initial = window.ytInitialPlayerResponse;
+      const initialId = initial && initial.videoDetails && initial.videoDetails.videoId;
+      if (initialId && initialId === vidId()) pr = initial;
+    }
     const tl = pr && pr.captions && pr.captions.playerCaptionsTracklistRenderer;
     return (tl && tl.captionTracks) || [];
   }
@@ -296,29 +302,47 @@
   //              target-id on the panel and NO language picker at all.
   // Everything below therefore keys off the CONTENT (which rows exist), never off
   // panel ids or class names, and supports both layouts.
-  function modernSegments() {
-    return [...document.querySelectorAll('transcript-segment-view-model')];
-  }
-  // For the legacy list the ACTIVE one is the last rendered: switching language appends
-  // a new list and leaves the old one behind, so reading the last avoids duplicates.
-  function legacySegmentList() {
-    const lists = document.querySelectorAll('ytd-transcript-segment-list-renderer');
-    const last = lists[lists.length - 1];
-    return last && last.querySelector('ytd-transcript-segment-renderer') ? last : null;
-  }
-  function transcriptReady() {
-    return modernSegments().length > 0 || !!legacySegmentList();
-  }
   function expandedTranscriptPanel() {
     return [...document.querySelectorAll('ytd-engagement-panel-section-list-renderer')]
       .find(p => p.getAttribute('visibility') === 'ENGAGEMENT_PANEL_VISIBILITY_EXPANDED' &&
                  (p.querySelector('transcript-segment-view-model') ||
                   p.querySelector('ytd-transcript-segment-renderer')));
   }
+  // Rows are read ONLY from the panel that is currently open. After in-site navigation
+  // YouTube can leave the previous video's panel in the DOM (hidden but still full of
+  // its rows) — reading the document at large would hand back the old video's text.
+  function modernSegments() {
+    const panel = expandedTranscriptPanel();
+    return panel ? [...panel.querySelectorAll('transcript-segment-view-model')] : [];
+  }
+  // For the legacy list the ACTIVE one is the last rendered: switching language appends
+  // a new list and leaves the old one behind, so reading the last avoids duplicates.
+  function legacySegmentList() {
+    const panel = expandedTranscriptPanel();
+    if (!panel) return null;
+    const lists = panel.querySelectorAll('ytd-transcript-segment-list-renderer');
+    const last = lists[lists.length - 1];
+    return last && last.querySelector('ytd-transcript-segment-renderer') ? last : null;
+  }
+  function transcriptReady() {
+    return modernSegments().length > 0 || !!legacySegmentList();
+  }
+  function isClickable(el) {
+    if (!el || el.offsetParent === null) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  // The control that opens the transcript. The modern layout calls it "Показать текст
+  // видео" and puts it at the bottom of the description; the classic one says
+  // "Расшифровка видео". Both labels are ALSO used by the tab chip inside the transcript
+  // panel itself, which is invisible while that panel is closed — clicking it does
+  // nothing, so only a genuinely clickable control counts.
   function findTranscriptButton() {
-    return [...document.querySelectorAll('button')].find(b => {
-      const a = b.getAttribute('aria-label') || '';
-      return /расшифровка видео|show transcript/i.test(a) && !/закрыть|close/i.test(a);
+    return [...document.querySelectorAll('button, a[role="button"], [role="button"]')].find((b) => {
+      const label = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
+      if (!/показать текст видео|показать расшифровку|расшифровка видео|show transcript|show video text/i.test(label)) return false;
+      if (/закрыть|close|скрыть/i.test(label)) return false;
+      return isClickable(b);
     });
   }
   // The modern panel groups "Эпизоды" and "Расшифровка видео" as tabs — if it opens on
@@ -346,18 +370,29 @@
   // YouTube sometimes lags and opens an empty panel — the caller retries.
   async function openTranscriptOnce() {
     if (transcriptReady()) return true;
-    let btn = findTranscriptButton();
-    if (!btn) { // the button may live inside the collapsed description
-      const more = document.querySelector('ytd-text-inline-expander #expand, #description #expand, tp-yt-paper-button#expand');
-      if (more) { try { more.click(); } catch (e) {} await sleep(500); btn = findTranscriptButton(); }
+    const scrollY = window.scrollY; // put the page back where the user left it
+    try {
+      let btn = findTranscriptButton();
+      if (!btn) {
+        // The transcript section sits at the end of the description and is only laid
+        // out once the description is expanded — until then its button has no size.
+        const more = document.querySelector('ytd-text-inline-expander #expand, #description #expand, tp-yt-paper-button#expand');
+        if (isClickable(more)) { try { more.click(); } catch (e) {} await sleep(700); btn = findTranscriptButton(); }
+      }
+      if (!btn) {
+        const anchor = document.querySelector('ytd-structured-description-content-renderer, #below, ytd-watch-metadata');
+        if (anchor) { try { anchor.scrollIntoView({ block: 'end' }); } catch (e) {} await sleep(700); btn = findTranscriptButton(); }
+      }
+      if (!btn) return false; // no transcript control on this video
+      try { btn.click(); } catch (e) {}
+      for (let i = 0; i < 25 && !transcriptReady(); i++) await sleep(150);
+      if (!transcriptReady() && activateTranscriptTab()) {
+        for (let i = 0; i < 20 && !transcriptReady(); i++) await sleep(150);
+      }
+      return transcriptReady();
+    } finally {
+      try { window.scrollTo(0, scrollY); } catch (e) {}
     }
-    if (!btn) return false; // no transcript button on this video
-    try { btn.click(); } catch (e) {}
-    for (let i = 0; i < 25 && !transcriptReady(); i++) await sleep(150);
-    if (!transcriptReady() && activateTranscriptTab()) {
-      for (let i = 0; i < 20 && !transcriptReady(); i++) await sleep(150);
-    }
-    return transcriptReady();
   }
   function transcriptLangLabel() {
     const panel = expandedTranscriptPanel();
