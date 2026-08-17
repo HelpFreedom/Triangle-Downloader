@@ -2,11 +2,21 @@
 // the YouTube player, drives the MAIN-world capture hook over window.postMessage,
 // then streams the captured tracks to the offscreen ffmpeg worker for muxing.
 (function () {
+  // Shared pure helpers (time / trim / base64 / filenames) — provided by lib/format.js,
+  // which the manifest injects BEFORE this script in the same isolated world.
+  const L = window.YTDL_LIB;
   const BTN_ID = 'ytdl-btn';
   // Clips up to this length get an exact (re-encoded) cut; longer ones are copied
   // instantly and start at the keyframe before the requested point. Re-encoding costs
   // roughly the clip's own length at 1080p, so ~1 minute is a comfortable ceiling.
   const EXACT_CUT_MAX_SEC = 60;
+  // Long ranges are saved as sequential parts when the «По частям» toggle is on or the
+  // adaptive warning suggests it. Each part is a full independent capture+mux, so memory
+  // stays bounded to one part and the 20-minute capture hard cap is never hit.
+  const PART_MAX_SEC = 15 * 60;   // ~15 min per part
+  const PEAK_MULT = 4;            // offscreen keeps ~4 copies of the source in RAM
+  const WARN_FRACTION = 0.25;     // warn when estimated peak > 25% of available RAM
+  const MIN_EST_MB = 300;         // never warn for small downloads
   let reqSeq = 1;
   const pending = new Map();
 
@@ -20,6 +30,14 @@
       const reqId = reqSeq++;
       pending.set(reqId, resolve);
       window.postMessage(Object.assign({ __ytdl_to_hook: true, cmd, reqId }, extra || {}), '*');
+    });
+  }
+  // Reject if the hook never answers (e.g. it failed to install) instead of leaving
+  // the menu hanging forever with no feedback.
+  function withTimeout(p, ms, message) {
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error(message)), ms);
+      p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
     });
   }
   // download drives streaming progress + a final result
@@ -36,20 +54,6 @@
       window.addEventListener('message', handler);
       window.postMessage(Object.assign({ __ytdl_to_hook: true, cmd: 'download', reqId }, params), '*');
     });
-  }
-
-  // ---- time helpers --------------------------------------------------------
-  function fmtTime(sec) {
-    sec = Math.max(0, Math.floor(sec || 0));
-    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-    const pad = (n) => String(n).padStart(2, '0');
-    return h + ':' + pad(m) + ':' + pad(s);
-  }
-  function parseTime(str) {
-    const parts = String(str).trim().split(':').map((p) => Number(p));
-    if (!parts.length || parts.some((n) => Number.isNaN(n))) return null;
-    let s = 0; for (const p of parts) s = s * 60 + p;
-    return s;
   }
 
   // ---- dom helpers (no innerHTML — the page enforces Trusted Types) ---------
@@ -101,16 +105,101 @@
 
   function head(text) { const d = document.createElement('div'); d.className = 'ytdl-menu-head'; d.textContent = text; return d; }
 
+  // Rough VP9 bitrate estimates (Mbps) used ONLY to estimate capture size. Real bitrate
+  // varies, so the estimate is conservative (high side). The offscreen document holds the
+  // whole track in RAM several times over (PEAK_MULT) — that peak is what the adaptive
+  // warning compares against the machine's actually available memory.
+  const EST_MBPS = { 2160: 25, 1440: 12, 1080: 6, 720: 4 };
+  const estimatedMB = (height, seconds) => ((EST_MBPS[height] || 6) * Math.max(0, seconds)) / 8;
+
+  // Available RAM, cached for the session. Prefers the real value from the background
+  // (chrome.system.memory, includes free capacity); falls back to navigator.deviceMemory,
+  // which caps at 8 GB — the worst case is assumed.
+  let memInfo = null; // { capacityMB, freeMB }
+  async function getMemInfo() {
+    if (memInfo) return memInfo;
+    try {
+      // withTimeout so a non-responding background can't hang the download click.
+      const r = await withTimeout(chrome.runtime.sendMessage({ t: 'ytdl-mem' }), 2000, 'memory timeout');
+      if (r && r.ok && r.free > 0) { memInfo = { capacityMB: r.capacity, freeMB: r.free }; return memInfo; }
+    } catch (e) { /* background not reachable — fall through */ }
+    const gb = navigator.deviceMemory || 8;
+    memInfo = { capacityMB: gb * 1024, freeMB: gb * 1024 };
+    return memInfo;
+  }
+
+  // Adaptive large-capture warning: returns 'parts' | 'single' | 'cancel' — or null when
+  // the estimated peak RAM stays safely under WARN_FRACTION of the available memory.
+  async function adaptiveWarning(height, start, end) {
+    const estMB = estimatedMB(height, end - start);
+    const peakMB = estMB * PEAK_MULT;
+    if (estMB < MIN_EST_MB) return null;
+    const mem = await getMemInfo();
+    if (peakMB <= mem.freeMB * WARN_FRACTION) return null;
+    const partCount = Math.ceil((end - start) / PART_MAX_SEC);
+    const txt = 'Ролик ≈ ' + Math.round(estMB) + ' МБ, при муксинге понадобится до ~' +
+      (peakMB / 1024).toFixed(1) + ' ГБ памяти.';
+    if (partCount > 1) {
+      return partsModal(txt + ' Рекомендую скачать по частям (' + partCount + ' × ~' +
+        Math.round(PART_MAX_SEC / 60) + ' мин).');
+    }
+    return window.confirm(txt + ' Продолжить?') ? 'single' : 'cancel';
+  }
+
+  // Three-choice modal (parts / whole / cancel). Resolves with the chosen action.
+  function partsModal(text) {
+    return new Promise((resolve) => {
+      const overlay = el('div', 'ytdl-modal');
+      const box = el('div', 'ytdl-modal-box');
+      box.appendChild(el('div', 'ytdl-modal-txt', text));
+      const btns = el('div', 'ytdl-modal-btns');
+      const cleanup = () => {
+        document.removeEventListener('keydown', onKey, true);
+        overlay.remove();
+      };
+      const mk = (label, cls, val) => {
+        const b = el('button', 'ytdl-modal-btn' + (cls ? ' ' + cls : ''), label);
+        b.addEventListener('click', () => { cleanup(); resolve(val); });
+        btns.appendChild(b);
+      };
+      const onKey = (ev) => { if (ev.key === 'Escape') { cleanup(); resolve('cancel'); } };
+      mk('Скачать по частям', 'primary', 'parts');
+      mk('Целиком', '', 'single');
+      mk('Отмена', 'cancel', 'cancel');
+      box.appendChild(btns);
+      overlay.appendChild(box);
+      overlay.addEventListener('click', (ev) => { if (ev.target === overlay) { cleanup(); resolve('cancel'); } });
+      document.addEventListener('keydown', onKey, true);
+      document.body.appendChild(overlay);
+    });
+  }
+
   async function onClick(e) {
     e.stopPropagation();
     if (menuEl) { closeMenu(); return; }
-    const info = await callHook('info');
+    let info;
+    try {
+      info = await withTimeout(callHook('info'), 4000, 'не удалось связаться с плеером');
+    } catch (err) {
+      const t = toast();
+      t.set('Ошибка: ' + (err.message || err), 1);
+      t.hide(5000);
+      return;
+    }
     const duration = Math.floor(info.duration || 0);
-    const heights = (info.heights || []).filter((h) => h === 1080 || h === 720);
-    if (!heights.includes(1080)) heights.unshift(1080);
-    if (!heights.includes(720)) heights.push(720);
+    // Show only the qualities the player actually reports as available — a missing
+    // option means the video can't be captured at it, and a falsely-labelled file
+    // (e.g. "[720p]" containing 360p) is worse than no option at all.
+    const heights = (info.heights || []).filter((h) => h === 2160 || h === 1440 || h === 1080 || h === 720);
     const uniq = [...new Set(heights)].sort((a, b) => b - a);
-    const { transcode = false } = await chrome.storage.local.get('transcode');
+    const { transcode = false, parts = false, mp3Bitrate = 192 } =
+      await chrome.storage.local.get(['transcode', 'parts', 'mp3Bitrate']);
+    // Radio/toggle state lives here (onClick scope) so the video/mp3 click handlers read
+    // the CURRENT selection — passing the initial storage value would ignore a change made
+    // in this menu session.
+    let current = !!transcode;
+    let partsOn = !!parts;    // «По частям» toggle — read at click time
+    let mp3Bit = Number(mp3Bitrate) || 192; // kbps — only affects MP3 downloads
 
     menuEl = document.createElement('div');
     menuEl.className = 'ytdl-menu';
@@ -123,16 +212,16 @@
     const inStart = document.createElement('input');
     const inEnd = document.createElement('input');
     inStart.className = inEnd.className = 'ytdl-time';
-    inStart.value = fmtTime(0);
-    inEnd.value = fmtTime(duration);
+    inStart.value = L.fmtTime(0);
+    inEnd.value = L.fmtTime(duration);
     [inStart, inEnd].forEach((i) => i.addEventListener('click', (ev) => ev.stopPropagation()));
     const dash = document.createElement('span'); dash.className = 'ytdl-frag-dash'; dash.textContent = '—';
     frag.appendChild(inStart); frag.appendChild(dash); frag.appendChild(inEnd);
     menuEl.appendChild(frag);
 
     function fragment() {
-      let start = parseTime(inStart.value);
-      let end = parseTime(inEnd.value);
+      let start = L.parseTime(inStart.value);
+      let end = L.parseTime(inEnd.value);
       if (start == null) start = 0;
       if (end == null || end <= 0) end = duration;
       start = Math.max(0, Math.min(start, duration));
@@ -140,25 +229,44 @@
       return { start, end };
     }
 
-    // --- video ---
-    menuEl.appendChild(head('Видео'));
-    uniq.forEach((h) => {
-      const item = el('div', 'ytdl-menu-item');
-      itemLabel(item, h + 'p', 'mp4');
-      item.addEventListener('click', () => {
-        const f = fragment(); closeMenu();
-        startDownload({ format: 'mp4', height: h, start: f.start, end: f.end }, info);
+    // --- video (only when at least one quality is available) ---
+    if (uniq.length) {
+      menuEl.appendChild(head('Видео'));
+      uniq.forEach((h) => {
+        const item = el('div', 'ytdl-menu-item');
+        itemLabel(item, h + 'p', 'mp4');
+        item.addEventListener('click', async () => {
+          const f = fragment(); closeMenu();
+          const range = f.end - f.start;
+          // Toggle on → always split long ranges; otherwise the adaptive warning may
+          // suggest parts for a large capture.
+          const parts = partsOn && range > PART_MAX_SEC ? L.splitRange(f.start, f.end, PART_MAX_SEC) : null;
+          if (parts) { startParts({ format: 'mp4', height: h }, info, current, parts); return; }
+          const decision = await adaptiveWarning(h, f.start, f.end);
+          if (decision === 'cancel') return;
+          if (decision === 'parts') {
+            startParts({ format: 'mp4', height: h }, info, current, L.splitRange(f.start, f.end, PART_MAX_SEC));
+            return;
+          }
+          startDownload({ format: 'mp4', height: h, start: f.start, end: f.end }, info, current);
+        });
+        menuEl.appendChild(item);
       });
-      menuEl.appendChild(item);
-    });
+    }
 
     // --- audio ---
     menuEl.appendChild(head('Аудио'));
     const mp3 = el('div', 'ytdl-menu-item');
     itemLabel(mp3, 'MP3', 'аудио');
-    mp3.addEventListener('click', () => {
+    mp3.addEventListener('click', async () => {
       const f = fragment(); closeMenu();
-      startDownload({ format: 'mp3', height: null, start: f.start, end: f.end }, info);
+      const range = f.end - f.start;
+      // mp3 is tiny memory-wise; the toggle only matters to stay under the capture time cap.
+      if (partsOn && range > PART_MAX_SEC) {
+        startParts({ format: 'mp3', height: null, mp3Bitrate: mp3Bit }, info, current, L.splitRange(f.start, f.end, PART_MAX_SEC));
+        return;
+      }
+      startDownload({ format: 'mp3', height: null, start: f.start, end: f.end, mp3Bitrate: mp3Bit }, info, current);
     });
     menuEl.appendChild(mp3);
 
@@ -169,28 +277,67 @@
     subs.addEventListener('click', () => { closeMenu(); downloadSubtitles(info); });
     menuEl.appendChild(subs);
 
-    // --- video format toggle ---
-    menuEl.appendChild(head('Формат видео'));
-    const formats = [
-      { key: false, title: 'Быстро', sub: 'VP9 в mp4, без перекодирования' },
-      { key: true, title: 'H.264 (совместимо)', sub: 'перекодирование, медленно' },
+    // --- video format toggle (only meaningful when video options exist) ---
+    if (uniq.length) {
+      menuEl.appendChild(head('Формат видео'));
+      const formats = [
+        { key: false, title: 'Быстро', sub: 'VP9 в mp4, без перекодирования' },
+        { key: true, title: 'H.264 (совместимо)', sub: 'перекодирование, медленно' },
+      ];
+      const rows = [];
+      formats.forEach((f) => {
+        const row = el('div', 'ytdl-menu-radio' + (current === f.key ? ' sel' : ''));
+        row.appendChild(el('span', 'ytdl-dot'));
+        const txt = el('span', 'ytdl-radio-txt');
+        txt.appendChild(el('b', null, f.title));
+        txt.appendChild(el('i', null, f.sub));
+        row.appendChild(txt);
+        row.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          current = f.key;
+          chrome.storage.local.set({ transcode: f.key });
+          rows.forEach((r, i) => r.classList.toggle('sel', formats[i].key === current));
+        });
+        rows.push(row);
+        menuEl.appendChild(row);
+      });
+      // --- «По частям» toggle: long ranges become sequential ~15-min files ---
+      const partsRow = el('div', 'ytdl-menu-radio' + (partsOn ? ' sel' : ''));
+      partsRow.appendChild(el('span', 'ytdl-dot'));
+      const partsTxt = el('span', 'ytdl-radio-txt');
+      partsTxt.appendChild(el('b', null, 'По частям'));
+      partsTxt.appendChild(el('i', null, 'длинные ролики — по ~' + Math.round(PART_MAX_SEC / 60) + ' мин'));
+      partsRow.appendChild(partsTxt);
+      partsRow.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        partsOn = !partsOn;
+        chrome.storage.local.set({ parts: partsOn });
+        partsRow.classList.toggle('sel', partsOn);
+      });
+      menuEl.appendChild(partsRow);
+    }
+
+    // --- MP3 bitrate: only affects MP3 downloads; default 192k matches the original ---
+    menuEl.appendChild(head('MP3 битрейт'));
+    const bitrates = [
+      { key: 192, title: '192 kbps', sub: 'как в оригинале' },
+      { key: 320, title: '320 kbps', sub: 'максимальное качество, файл больше' },
     ];
-    let current = !!transcode;
-    const rows = [];
-    formats.forEach((f) => {
-      const row = el('div', 'ytdl-menu-radio' + (current === f.key ? ' sel' : ''));
+    const bitRows = [];
+    bitrates.forEach((b) => {
+      const row = el('div', 'ytdl-menu-radio' + (mp3Bit === b.key ? ' sel' : ''));
       row.appendChild(el('span', 'ytdl-dot'));
       const txt = el('span', 'ytdl-radio-txt');
-      txt.appendChild(el('b', null, f.title));
-      txt.appendChild(el('i', null, f.sub));
+      txt.appendChild(el('b', null, b.title));
+      txt.appendChild(el('i', null, b.sub));
       row.appendChild(txt);
       row.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        current = f.key;
-        chrome.storage.local.set({ transcode: f.key });
-        rows.forEach((r, i) => r.classList.toggle('sel', formats[i].key === current));
+        mp3Bit = b.key;
+        chrome.storage.local.set({ mp3Bitrate: b.key });
+        bitRows.forEach((r, i) => r.classList.toggle('sel', bitrates[i].key === mp3Bit));
       });
-      rows.push(row);
+      bitRows.push(row);
       menuEl.appendChild(row);
     });
 
@@ -204,6 +351,7 @@
   // ---- progress toast ------------------------------------------------------
   function toast() {
     let box = document.getElementById('ytdl-toast');
+    let hideTimer = null;
     if (!box) {
       box = el('div'); box.id = 'ytdl-toast';
       const bar = el('div', 'ytdl-toast-bar'); bar.appendChild(el('i'));
@@ -213,20 +361,18 @@
     }
     return {
       set(txt, pct) {
+        // A new message cancels any pending hide so a stale timer (e.g. from the
+        // previous part of a split download) can't hide the toast mid-part.
+        if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
         box.querySelector('.ytdl-toast-txt').textContent = txt;
         box.querySelector('.ytdl-toast-bar i').style.width = Math.round((pct || 0) * 100) + '%';
         box.classList.add('show');
       },
-      hide(delay) { setTimeout(() => box.classList.remove('show'), delay || 0); },
+      hide(delay) {
+        if (hideTimer) clearTimeout(hideTimer);
+        hideTimer = setTimeout(() => { hideTimer = null; box.classList.remove('show'); }, delay || 0);
+      },
     };
-  }
-
-  function safeName(s) {
-    return (s || 'video').replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
-  }
-  function fragSuffix(start, end, duration) {
-    if (start <= 0 && end >= duration - 0.5) return '';
-    return ' (' + fmtTime(start).replace(/:/g, '.') + '-' + fmtTime(end).replace(/:/g, '.') + ')';
   }
 
   async function downloadSubtitles(info) {
@@ -235,7 +381,7 @@
     try {
       const res = await callHook('subtitles');
       if (!res || !res.ok) throw new Error((res && res.error) || 'нет субтитров');
-      const filename = safeName(info.title) + ' [' + (res.lang || 'txt') + '].txt';
+      const filename = L.safeName(info.title) + ' [' + (res.lang || 'txt') + '].txt';
       // small text → a data URL is enough; BOM keeps Cyrillic correct on Windows
       const url = 'data:text/plain;charset=utf-8,' + encodeURIComponent('﻿' + res.text);
       const save = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename });
@@ -249,54 +395,48 @@
     }
   }
 
-  async function startDownload(opts, info) {
-    const { format, height, start, end } = opts;
+  // Download one concrete range (used for single downloads AND for one part of a split).
+  // Shows per-step progress in `t` prefixed with `prefix` (e.g. "Часть 2 из 4: ") and
+  // returns { ok } / { ok: false, error } instead of raising.
+  async function downloadOne(opts, info, transcode, t, prefix) {
+    const { format, height, start, end, mp3Bitrate } = opts;
     const duration = Math.floor(info.duration || 0);
     const isMp3 = format === 'mp3';
     const label = isMp3 ? 'MP3' : height + 'p';
-    const t = toast();
-    t.set('Готовлю ' + label + ' — загрузка сегментов…', 0.02);
-
-    const { transcode = false } = await chrome.storage.local.get('transcode');
 
     const onProg = (msg) => {
       if (msg && msg.t === 'ytdl-progress') {
-        t.set((isMp3 ? 'Кодирование MP3… ' : 'Точная обрезка (перекодирование)… ') +
+        t.set(prefix + (isMp3 ? 'Кодирование MP3… ' : 'Точная обрезка (перекодирование)… ') +
           Math.round(msg.value * 100) + '%', 0.55 + msg.value * 0.45);
       }
     };
     chrome.runtime.onMessage.addListener(onProg);
     try {
       const result = await download({ height, format, start, end }, (d) => {
-        t.set('Загрузка сегментов ' + label + '… ' + Math.round(d.progress * 100) + '%', d.progress * 0.5);
+        t.set(prefix + 'Загрузка сегментов ' + label + '… ' + Math.round(d.progress * 100) + '%', d.progress * 0.5);
       });
 
       const ext = isMp3 ? '.mp3' : '.mp4';
-      const filename = safeName(info.title) + (isMp3 ? '' : ' [' + height + 'p]') +
-        fragSuffix(start, end, duration) + ext;
+      // The player may serve a lower resolution than requested (ABR/viewport cap) —
+      // name the file after what we actually got so it isn't misleading, and note it
+      // in the toast below.
+      const actualH = result.height || 0;
+      const downgraded = !isMp3 && actualH >= 100 && actualH < height;
+      const effH = downgraded ? actualH : height;
+      const filename = L.safeName(info.title) + (isMp3 ? '' : ' [' + effH + 'p]') +
+        (opts.partLabel || L.fragSuffix(start, end, duration)) + ext;
 
       // Capture starts at a segment boundary at or before `start`, so trimming must be
       // RELATIVE to the captured file — ffmpeg's -ss counts from the file's own start,
       // not from the video's absolute timeline.
       const capturedFrom = typeof result.capturedFrom === 'number' ? result.capturedFrom : start;
-      const trimStart = Math.max(0, start - capturedFrom);
-      const trimDuration = Math.max(0, end - start);
-      const isFragment = start > 0 || end < duration - 0.5;
+      const job = L.computeJob({ start, end, duration, capturedFrom, isMp3, transcode, exactCutMaxSec: EXACT_CUT_MAX_SEC });
+      const { trimStart, trimDuration, isFragment, exactCut, doTranscode, alignedStart, quickEncode } = job;
 
-      // A copied stream can only start on a keyframe, so an exact start needs
-      // re-encoding. That costs roughly the clip's own length, so we only do it
-      // automatically for short clips; longer ones stay instant and start at the
-      // keyframe just before the requested point.
-      const needsExactCut = isFragment && trimStart > 0.3;
-      const shortEnough = trimDuration > 0 && trimDuration <= EXACT_CUT_MAX_SEC;
-      const exactCut = !isMp3 && needsExactCut && shortEnough;
-      const doTranscode = isMp3 ? true : (!!transcode || exactCut);
-      const alignedStart = !isMp3 && needsExactCut && !doTranscode;
-
-      t.set(isMp3 ? 'Кодирование MP3…'
+      t.set(prefix + (isMp3 ? 'Кодирование MP3…'
         : (exactCut ? 'Точная обрезка фрагмента (перекодирование)…'
           : (transcode ? 'Перекодирование в H.264 (может занять дольше ролика)…'
-            : 'Склейка дорожек…')), 0.55);
+            : 'Склейка дорожек…'))), 0.55);
 
       const res = await muxViaOffscreen({
         format,
@@ -304,35 +444,71 @@
         audio: result._a,
         videoMime: result.video && result.video.mime,
         audioMime: result.audio && result.audio.mime,
-        filename, transcode: doTranscode, quickEncode: exactCut && !transcode,
+        filename, transcode: doTranscode, quickEncode,
         trimStart,
         // only limit duration when a real fragment was requested
         trimDuration: isFragment ? trimDuration : 0,
+        mp3Bitrate,
       });
 
       if (!res || !res.ok) throw new Error(res && res.error || 'mux failed');
-      t.set('Готово: ' + (res.filename || filename) +
-        (alignedStart ? ' — начало выровнено по опорному кадру' : ''), 1);
-      t.hide(alignedStart ? 7000 : 4000);
+      const partialNote = result.complete === false
+        ? (result.restarts > 0
+            ? ' — во время захвата переключилось качество, файл может быть обрезан'
+            : ' — захват неполный, файл может быть обрезан')
+        : '';
+      const resNote = downgraded ? ' — плеер отдал ' + actualH + 'p вместо ' + height + 'p' : '';
+      t.set(prefix + 'Готово: ' + (res.filename || filename) +
+        (alignedStart ? ' — начало выровнено по опорному кадру' : '') + partialNote + resNote, 1);
+      t.hide(alignedStart || partialNote || resNote ? 7000 : 4000);
+      return { ok: true };
     } catch (err) {
-      t.set('Ошибка: ' + (err.message || err), 1);
-      t.hide(6000);
+      t.set(prefix + 'Ошибка: ' + (err.message || err), 1);
+      t.hide(7000);
       console.error('[Triangle]', err);
+      return { ok: false, error: (err && err.message) || String(err) };
     } finally {
       chrome.runtime.onMessage.removeListener(onProg);
     }
   }
 
-  // ---- transfer to offscreen ffmpeg ---------------------------------------
-  function b64encode(u8) {
-    let s = '';
-    const STEP = 0x8000;
-    for (let i = 0; i < u8.length; i += STEP) {
-      s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + STEP, u8.length)));
+  // Save a long range as sequential parts — one independent file per part.
+  async function startParts(base, info, transcode, parts) {
+    const { format, height, mp3Bitrate } = base;
+    const label = format === 'mp3' ? 'MP3' : height + 'p';
+    const t = toast();
+    t.set('Скачивание по частям: 0 из ' + parts.length + '…', 0.02);
+    let failed = null;
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      // Emit an immediate per-part message so the toast never goes blank between
+      // parts (the first capture progress callback is seconds away).
+      t.set('Часть ' + (i + 1) + ' из ' + parts.length + ': готовлю ' + label + '…', 0.02);
+      const r = await downloadOne({
+        format, height, start: p.start, end: p.end,
+        mp3Bitrate,
+        partLabel: ' (part ' + (i + 1) + ' of ' + parts.length + ')',
+      }, info, transcode, t, 'Часть ' + (i + 1) + ' из ' + parts.length + ': ');
+      if (!r.ok) { failed = { index: i + 1, error: r.error }; break; }
     }
-    return btoa(s);
+    if (failed) {
+      t.set('Ошибка в части ' + failed.index + ': ' + failed.error, 1);
+      t.hide(8000);
+    } else {
+      t.set('Готово: ' + parts.length + ' частей (' + label + ')', 1);
+      t.hide(6000);
+    }
   }
 
+  // Single-download entry point (parts are handled by startParts / the click handlers).
+  async function startDownload(opts, info, transcode) {
+    const { format, height } = opts;
+    const t = toast();
+    t.set('Готовлю ' + (format === 'mp3' ? 'MP3' : height + 'p') + ' — загрузка сегментов…', 0.02);
+    await downloadOne(opts, info, transcode, t, '');
+  }
+
+  // ---- transfer to offscreen ffmpeg ---------------------------------------
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // The ffmpeg side lives in an offscreen document that the service worker creates on
@@ -377,6 +553,7 @@
       videoMime: job.videoMime, audioMime: job.audioMime,
       transcode: !!job.transcode, quickEncode: !!job.quickEncode,
       trimStart: job.trimStart || 0, trimDuration: job.trimDuration || 0,
+      mp3Bitrate: job.mp3Bitrate, // default (192) is owned by the offscreen side
     });
 
     let seq = 0; // lets the receiver drop a repeated chunk instead of doubling the data
@@ -385,7 +562,7 @@
       const view = new Uint8Array(buf);
       for (let off = 0; off < view.length; off += CHUNK) {
         const slice = view.subarray(off, Math.min(off + CHUNK, view.length));
-        const r = await sendToOffscreen({ t: 'ytdl-chunk', track: name, seq, b64: b64encode(slice) });
+        const r = await sendToOffscreen({ t: 'ytdl-chunk', track: name, seq, b64: L.b64encode(slice) });
         if (!r || !r.ok) {
           throw new Error('передача данных прервалась (' + name + ')' + (r && r.error ? ': ' + r.error : ''));
         }

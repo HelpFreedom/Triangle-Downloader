@@ -10,8 +10,9 @@ No `yt-dlp`, no third‑party sites or servers: everything runs locally in your 
 
 ## Features
 
-- **Video** — 720p / 1080p as `.mp4` (video + audio).
-- **Audio** — `.mp3` (audio track only).
+- **Video** — 720p / 1080p / 1440p / 2160p as `.mp4` (video + audio; 1440p and 2160p are
+  shown only when the video actually supports them).
+- **Audio** — `.mp3` (audio track only; bitrate 192/320 kbps, selectable).
 - **Clip selection** — "start — end" fields in the menu (default `0:00:00` … full length).
   **Only the selected range is fetched**, not the whole video: e.g. 10 seconds out of an
   hour-long video download in a couple of seconds.
@@ -26,6 +27,10 @@ No `yt-dlp`, no third‑party sites or servers: everything runs locally in your 
   whatever it displays is what gets saved.
 - **Video format** — "Fast" (VP9 in mp4, no re‑encoding, seconds) or "H.264" (re‑encode for
   compatibility with older players, slow).
+- **Download in parts** — long videos can be saved in parts (~15 minutes per file): the
+  "По частям" toggle in the menu, or an adaptive warning that offers splitting when the
+  estimated capture needs too much memory (resolution, duration and available RAM are
+  taken into account).
 - **Auto‑disables Autoplay** — the extension turns off YouTube's "Autoplay next" so the next
   video won't start on its own.
 
@@ -50,10 +55,13 @@ No `yt-dlp`, no third‑party sites or servers: everything runs locally in your 
 1. Click the ▽ button in the player to open the menu.
 2. Optionally set the **start** and **end** of a clip (defaults to the whole video).
 3. Choose what to download:
-   - **Video** → `1080p` or `720p`;
+   - **Video** → `2160p`, `1440p`, `1080p` or `720p` (whichever are available);
    - **Audio** → `MP3`;
    - **Subtitles** → `.txt`.
-4. For video you can switch the **Format**: "Fast" (default) or "H.264".
+4. For video you can switch the **Format**: "Fast" (default) or "H.264", and enable
+   **"По частям"** — long videos are then saved in ~15-minute parts (files named
+   "… (part 1 of N)"). When a capture is estimated to need too much memory, the extension
+   itself offers downloading by parts.
 5. Progress is shown in a toast; the finished file is saved via the browser's normal download.
 
 ## How it works
@@ -78,6 +86,11 @@ extension hooks in where the data has already been decrypted and split into trac
 
 - Capture works by seeking through the buffer, so for very long videos it takes time
   proportional to the length.
+- 1440p and 2160p are offered only when the video supports them. Files at those resolutions
+  are huge: capture and muxing need lots of memory and time, and long 4K videos may hit the
+  capture limits — prefer downloading fragments for 4K.
+- For long videos use **"По частям"**: each part is captured separately, so neither the
+  capture time limit nor memory accumulation is hit.
 - "H.264" and `.mp3` re‑encode via `ffmpeg.wasm` (single‑threaded), which is noticeably slower
   than the fast remux — up to a few minutes on long videos.
 - In "Fast" mode the `.mp4` contains VP9/Opus codecs — it plays in Chrome, VLC and modern

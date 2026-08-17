@@ -5,6 +5,9 @@
 // or VP9 video + Opus audio), so this re-encodes rather than remuxes.
 
 const { FFmpeg } = FFmpegWASM;
+// Shared pure helpers (base64 / byte concat / MIME→ext / ffmpeg run cascade) from
+// lib/format.js, loaded by offscreen.html BEFORE this script.
+const L = window.YTDL_LIB;
 
 let ff = null;
 let ffLoading = null;
@@ -28,41 +31,26 @@ async function getFF() {
     ff = inst;
     return inst;
   })();
+  // On failure, forget the rejected promise so the NEXT download retries instead of
+  // being stuck with a permanently-rejected ffLoading (which would brick all muxing
+  // until the extension is reloaded). The current caller still receives the error.
+  ffLoading = ffLoading.catch((err) => { ffLoading = null; throw err; });
   return ffLoading;
-}
-
-function b64decode(s) {
-  const bin = atob(s);
-  const u8 = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-  return u8;
-}
-
-function concat(parts) {
-  let n = 0; for (const p of parts) n += p.length;
-  const out = new Uint8Array(n);
-  let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
-  return out;
-}
-function extFor(mime) {
-  if (/webm/i.test(mime)) return 'webm';
-  if (/mp4/i.test(mime)) return 'mp4';
-  return 'bin';
 }
 
 async function finalize() {
   const inst = await getFF();
   const isMp3 = acc.format === 'mp3';
-  const aName = 'a.' + extFor(acc.audioMime);
+  const aName = 'a.' + L.extFor(acc.audioMime);
 
-  const aBytes = concat(acc.audio);
+  const aBytes = L.concat(acc.audio);
   if (!aBytes.length) throw new Error('пустые данные аудио');
   await inst.writeFile(aName, aBytes);
 
   let vName = null;
   if (!isMp3) {
-    vName = 'v.' + extFor(acc.videoMime);
-    const vBytes = concat(acc.video);
+    vName = 'v.' + L.extFor(acc.videoMime);
+    const vBytes = L.concat(acc.video);
     if (!vBytes.length) throw new Error('пустые данные видео');
     await inst.writeFile(vName, vBytes);
   }
@@ -73,66 +61,12 @@ async function finalize() {
   // Passing an absolute position produced an empty file (0 bytes of output).
   const trimStart = Math.max(0, Number(acc.trimStart) || 0);
   const trimDuration = Math.max(0, Number(acc.trimDuration) || 0);
-  // Re-encoding cuts frame-accurately, so it seeks to the exact requested point.
-  // A stream copy cannot: video can only start on a keyframe while audio would be cut
-  // precisely, which leaves the lead-in silent. So the copy path seeks nothing and just
-  // limits the length — both tracks start together at the keyframe before the request.
-  const exact = !!acc.transcode;
-  const seek = exact && trimStart > 0.05 ? ['-ss', trimStart.toFixed(3)] : [];
-  const limit = trimDuration > 0.05
-    ? ['-t', (exact ? trimDuration : trimStart + trimDuration).toFixed(3)]
-    : [];
-  const inV = (s) => (vName ? [...s, '-i', vName] : []);
-  const inA = (s) => [...s, '-i', aName];
-  // Stream copy can only cut on keyframes, so a trimmed copy starts at the keyframe
-  // BEFORE the requested point. MP4 can hide that lead-in with an edit list, but the
-  // skipped frames stay inside the file and players that take the duration from the
-  // media track then show a frozen tail at the end. So the copy path always normalizes
-  // timestamps (lead-in becomes ordinary content) and exact cuts are produced by
-  // re-encoding instead — see the "exact cut" decision in content_ui.js.
-  const ZERO = ['-avoid_negative_ts', 'make_zero'];
-
-  const runs = [];
-  if (isMp3) {
-    runs.push({
-      name: 'mp3', out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3',
-      args: [...inA(seek), ...limit, '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'],
-    });
-  } else if (acc.transcode) {
-    // Re-encode to H.264 + AAC. An automatic exact cut of a short clip favours speed
-    // (ultrafast is ~2× quicker at 1080p); the user-selected compatibility mode keeps
-    // the better-compressing preset.
-    const preset = acc.quickEncode ? 'ultrafast' : 'veryfast';
-    runs.push({
-      name: 'h264', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-      args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
-        '-c:v', 'libx264', '-preset', preset, '-crf', '20', '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', 'out.mp4'],
-    });
-  } else {
-    // Fast path: stream-copy the original tracks (VP9/Opus) into mp4 (seconds).
-    runs.push({
-      name: 'mp4-copy', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-      args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
-        '-c', 'copy', '-strict', '-2', ...ZERO, '-movflags', '+faststart', 'out.mp4'],
-    });
-    if (seek.length || limit.length) {
-      // If trimming upsets the copy path, keep the whole captured range rather than fail
-      // (it covers the fragment, just aligned to segment boundaries).
-      runs.push({
-        name: 'mp4-copy-untrimmed', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-        args: [...inV([]), ...inA([]), '-map', '0:v:0', '-map', '1:a:0',
-          '-c', 'copy', '-strict', '-2', '-avoid_negative_ts', 'make_zero',
-          '-movflags', '+faststart', 'out.mp4'],
-      });
-    }
-    // Last resort if mp4 refuses these codecs.
-    runs.push({
-      name: 'webm-copy', out: 'out.webm', type: 'video/webm', ext: '.webm',
-      args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
-        '-c', 'copy', ...ZERO, 'out.webm'],
-    });
-  }
+  // The run cascade (mp3 / h264 / mp4-copy ± untrimmed / webm-copy) and the seek/limit
+  // math live in lib/format.js (buildRuns) — it is unit-tested and identical in prod.
+  const runs = L.buildRuns({
+    isMp3, transcode: acc.transcode, quickEncode: acc.quickEncode,
+    trimStart, trimDuration, vName, aName, mp3Bitrate: acc.mp3Bitrate,
+  });
 
   let data = null, chosen = null;
   const failures = [];
@@ -144,7 +78,7 @@ async function finalize() {
       try {
         const out = await inst.readFile(run.out);
         // a non-empty result only — a "successful" run can still yield an empty file
-        if (out && out.length > 1024) { data = out; chosen = run; break; }
+        if (out && out.length > 0) { data = out; chosen = run; break; }
         failures.push(run.name + ': пустой результат');
       } catch (e) { failures.push(run.name + ': файл не создан'); }
     } else {
@@ -165,8 +99,12 @@ async function finalize() {
   const blob = new Blob([data.buffer], { type: chosen.type });
   const url = URL.createObjectURL(blob);
   const res = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename });
-  // keep the blob alive briefly so chrome.downloads can read it, then release
-  setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
+  // The blob is revoked by the background once the download actually completes
+  // (ytdl-revoke). Belt-and-braces: if the service worker is terminated before the
+  // download finishes, its listener and fallback timer are lost — this document timer
+  // always runs and guarantees the blob is eventually released. Double revocation is
+  // harmless (revoking an already-revoked URL is a no-op).
+  setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 10 * 60 * 1000);
   return res && res.ok ? { ok: true, filename } : { ok: false, error: (res && res.error) || 'save failed' };
 }
 
@@ -178,6 +116,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // is actually able to receive.
   if (msg.t === 'ytdl-ping') { sendResponse({ ok: true }); return; }
 
+  if (msg.t === 'ytdl-revoke') {
+    // background tells us the download finished (or failed) and the blob is no longer
+    // being read — safe to release the object URL now.
+    try { URL.revokeObjectURL(msg.url); } catch (e) {}
+    sendResponse({ ok: true });
+    return; // sync
+  }
+
   if (msg.t === 'ytdl-begin') {
     acc.video = []; acc.audio = []; acc.seq = 0;
     acc.videoMime = msg.videoMime || '';
@@ -186,6 +132,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     acc.transcode = !!msg.transcode;
     acc.format = msg.format || 'mp4';
     acc.quickEncode = !!msg.quickEncode;
+    acc.mp3Bitrate = Number(msg.mp3Bitrate) || 192; // kbps, default matches the original
     acc.trimStart = msg.trimStart || 0;
     acc.trimDuration = msg.trimDuration || 0;
     // warm up ffmpeg while chunks stream in
@@ -204,7 +151,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (seq < acc.seq) { sendResponse({ ok: true, duplicate: true }); return; }
         if (seq > acc.seq) { sendResponse({ ok: false, error: 'пропущен фрагмент данных' }); return; }
       }
-      acc[msg.track].push(b64decode(msg.b64));
+      acc[msg.track].push(L.b64decode(msg.b64));
       acc.seq++;
       sendResponse({ ok: true });
     } catch (e) {

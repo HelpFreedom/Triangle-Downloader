@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Triangle Downloader",
-  "version": "1.4.3",
-  "description": "Скачивает открытое видео YouTube (720p/1080p mp4, mp3, выбор фрагмента), перехватывая поток самого плеера. Без yt-dlp и внешних сервисов.",
-  "permissions": ["downloads", "offscreen", "storage"],
+  "version": "1.5.0",
+  "minimum_chrome_version": "116",
+  "description": "Скачивает открытое видео YouTube (720p–2160p mp4, mp3, выбор фрагмента), перехватывая поток самого плеера. Без yt-dlp и внешних сервисов.",
+  "permissions": ["downloads", "offscreen", "storage", "system.memory"],
   "host_permissions": ["*://www.youtube.com/*"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [
@@ -16,7 +17,7 @@
     },
     {
       "matches": ["*://www.youtube.com/*"],
-      "js": ["content_ui.js"],
+      "js": ["lib/format.js", "content_ui.js"],
       "css": ["content_ui.css"],
       "run_at": "document_idle",
       "world": "ISOLATED",

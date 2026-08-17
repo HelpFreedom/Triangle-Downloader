@@ -119,3 +119,43 @@
   background: #ff4e45;
   transition: width .2s;
 }
+
+/* adaptive large-capture modal (parts / whole / cancel) */
+.ytdl-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  background: rgba(0,0,0,.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.ytdl-modal-box {
+  width: min(360px, calc(100vw - 48px));
+  background: #1c1c1c;
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 14px;
+  padding: 18px 18px 14px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.6);
+  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
+  color: #fff;
+}
+.ytdl-modal-txt { font-size: 13.5px; line-height: 1.5; margin-bottom: 14px; }
+.ytdl-modal-btns { display: flex; flex-direction: column; gap: 8px; }
+.ytdl-modal-btn {
+  border: none;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+  background: rgba(255,255,255,.1);
+  color: #fff;
+  text-align: left;
+  transition: background .15s;
+}
+.ytdl-modal-btn:hover { background: rgba(255,255,255,.18); }
+.ytdl-modal-btn.primary { background: #ff4e45; color: #fff; }
+.ytdl-modal-btn.primary:hover { background: #ff6b63; }
+.ytdl-modal-btn.cancel { background: transparent; color: #9aa0a6; text-align: center; }
+.ytdl-modal-btn.cancel:hover { background: rgba(255,255,255,.06); color: #fff; }
