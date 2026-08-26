@@ -167,7 +167,9 @@ async function finalize() {
   const res = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename });
   // keep the blob alive briefly so chrome.downloads can read it, then release
   setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
-  return res && res.ok ? { ok: true, filename } : { ok: false, error: (res && res.error) || 'save failed' };
+  return res && res.ok
+    ? { ok: true, filename: res.filename || filename }
+    : { ok: false, error: (res && res.error) || 'save failed' };
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

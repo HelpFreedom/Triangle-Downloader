@@ -3,6 +3,21 @@
 // service worker has no DOM/Worker/document that ffmpeg needs), so all muxing
 // happens in the offscreen document; the worker only orchestrates.
 
+// Last-resort file name: keep the extension, drop emoji and anything else Chrome may
+// consider illegal, so a download is never lost just because of the video's title.
+function plainFilename(name) {
+  const dot = name.lastIndexOf('.');
+  const ext = dot > 0 ? name.slice(dot) : '';
+  const base = (dot > 0 ? name.slice(0, dot) : name)
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2190}-\u{2BFF}\u{FE00}-\u{FE0F}\u{200B}-\u{200F}\u{2066}-\u{2069}]/gu, '')
+    .replace(/[\\/:*?"<>|\u0000-\u001F\u007F]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[.\s]+|[.\s]+$/g, '')
+    .slice(0, 80)
+    .trim();
+  return (base || 'video') + ext;
+}
+
 let creating = null; // de-dupe concurrent createDocument calls
 
 async function ensureOffscreen() {
@@ -30,9 +45,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.t === 'ytdl-save') {
     // Offscreen finished muxing and handed us a blob URL to save.
-    chrome.downloads.download({ url: msg.url, filename: msg.filename, saveAs: false })
-      .then((id) => sendResponse({ ok: true, id }))
-      .catch((e) => sendResponse({ ok: false, error: String(e) }));
+    const save = (filename) =>
+      chrome.downloads.download({ url: msg.url, filename, saveAs: false });
+    save(msg.filename)
+      .then((id) => sendResponse({ ok: true, id, filename: msg.filename }))
+      .catch(() => {
+        // Chrome rejects some titles outright and says only "Invalid filename".
+        // Save the finished file under a plain name instead of throwing it away.
+        const alt = plainFilename(msg.filename || 'video');
+        save(alt)
+          .then((id) => sendResponse({ ok: true, id, filename: alt }))
+          .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+      });
     return true; // async
   }
 });

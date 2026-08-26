@@ -221,8 +221,19 @@
     };
   }
 
+  // Chrome refuses a download whose filename holds characters it deems illegal, and
+  // reports only "Invalid filename". Besides the obvious reserved punctuation that
+  // includes invisible formatting characters — the zero-width joiner inside an emoji
+  // like the detective, bidi marks, byte-order marks — plus leading/trailing dots.
   function safeName(s) {
-    return (s || 'video').replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+    const cleaned = String(s || '')
+      .replace(/[\\/:*?"<>|]+/g, ' ')
+      .replace(/[\u0000-\u001F\u007F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFE00-\uFE0F\uFEFF]/g, '')
+      .replace(/\s+/g, ' ')
+      .replace(/^[.\s]+|[.\s]+$/g, '')
+      .slice(0, 100)
+      .trim();
+    return cleaned || 'video';
   }
   function fragSuffix(start, end, duration) {
     if (start <= 0 && end >= duration - 0.5) return '';
@@ -240,7 +251,7 @@
       const url = 'data:text/plain;charset=utf-8,' + encodeURIComponent('﻿' + res.text);
       const save = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename });
       if (!save || !save.ok) throw new Error((save && save.error) || 'не удалось сохранить');
-      t.set('Готово: ' + filename, 1);
+      t.set('Готово: ' + (save.filename || filename), 1);
       t.hide(4000);
     } catch (err) {
       t.set('Ошибка: ' + (err.message || err), 1);
