@@ -26,6 +26,7 @@
     // does NOT re-init audio) — so we remember them and seed a track that starts
     // receiving media mid-capture without a fresh init of its own.
     lastInit: Object.create(null), // kind -> { bytes: Uint8Array, mime: string }
+    sb: Object.create(null),       // kind -> the live SourceBuffer
   };
 
   function vidId() { try { return new URLSearchParams(location.search).get('v'); } catch (e) { return null; } }
@@ -81,9 +82,27 @@
     try {
       sb.__ytdlMime = mime;
       sb.__ytdlKind = /audio/i.test(mime) ? 'audio' : (/video/i.test(mime) ? 'video' : null);
+      // keep a handle: each track's own buffered range tells where its captured bytes
+      // begin, and video and audio segments do NOT start at the same instant
+      if (sb.__ytdlKind) store.sb[sb.__ytdlKind] = sb;
     } catch (e) {}
     return sb;
   };
+
+  // Where this track's data containing `t` begins. Reading it per track matters: the
+  // audio segment covering a point can start many seconds before the video keyframe.
+  function bufferedStartOf(kind, t) {
+    const sb = store.sb[kind];
+    if (!sb) return null;
+    try {
+      const b = sb.buffered;
+      for (let i = 0; i < b.length; i++) {
+        if (b.start(i) <= t + 0.5 && b.end(i) >= t) return b.start(i);
+      }
+      for (let i = 0; i < b.length; i++) if (b.end(i) >= t) return b.start(i);
+    } catch (e) { /* buffer detached after navigation */ }
+    return null;
+  }
 
   const OrigAppend = SourceBuffer.prototype.appendBuffer;
   SourceBuffer.prototype.appendBuffer = function (data) {
@@ -235,12 +254,24 @@
       return t;
     };
     let capturedFrom = capStart;
+    // Track where each stream's own data begins. The audio segment covering the
+    // requested point routinely starts seconds earlier than the video keyframe, and
+    // muxing two files that begin at different instants is what shifts sound against
+    // picture — so both are reported and the trims are computed per track.
+    let firstVideoAt = null, firstAudioAt = null;
+    const noteTrackStarts = () => {
+      const v0 = bufferedStartOf('video', capStart);
+      const a0 = bufferedStartOf('audio', capStart);
+      if (v0 != null) firstVideoAt = firstVideoAt == null ? v0 : Math.min(firstVideoAt, v0);
+      if (a0 != null) firstAudioAt = firstAudioAt == null ? a0 : Math.min(firstAudioAt, a0);
+    };
     let cursor = capStart, stall = 0;
     const span = Math.max(0.1, capEnd - capStart);
     const started = Date.now();
     try {
       try { v.pause(); } catch (e) {}
       capturedFrom = Math.min(capStart, bufferedStartAt(capStart));
+      noteTrackStarts();
       while (true) {
         await sleep(350);
         if (vidId() !== capId) throw new Error('видео переключилось во время захвата');
@@ -260,8 +291,10 @@
           if (stall >= 60) break;                        // ~21s with no progress → give up
         }
         if (Date.now() - started > 20 * 60 * 1000) break; // hard cap
+        noteTrackStarts();
       }
       capturedFrom = Math.min(capturedFrom, bufferedStartAt(capStart));
+      noteTrackStarts();
     } finally {
       store.capturing = false;
       // restore player state
@@ -272,7 +305,11 @@
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
     onProgress(1);
-    return { capturedFrom: Math.max(0, capturedFrom) };
+    return {
+      capturedFrom: Math.max(0, capturedFrom),
+      capturedFromVideo: firstVideoAt == null ? null : Math.max(0, firstVideoAt),
+      capturedFromAudio: firstAudioAt == null ? null : Math.max(0, firstAudioAt),
+    };
   }
 
   // ---- subtitles (read from the built-in transcript panel) -----------------
@@ -508,6 +545,8 @@
         const payload = {
           ok: true, done: true,
           capturedFrom: cap.capturedFrom,   // where the captured file actually begins
+          capturedFromVideo: cap.capturedFromVideo,
+          capturedFromAudio: cap.capturedFromAudio,
           audio: { mime: aud.mime, size: aud.bytes.byteLength },
         };
         const transfers = [aud.bytes.buffer];

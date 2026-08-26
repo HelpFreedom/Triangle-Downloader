@@ -67,23 +67,25 @@ async function finalize() {
     await inst.writeFile(vName, vBytes);
   }
 
-  // Fragment trim. IMPORTANT: -ss counts from the captured file's own beginning, and
-  // capture starts at a segment boundary at or before the requested start — so the
-  // offset here is RELATIVE (trimStart), never the absolute position in the video.
-  // Passing an absolute position produced an empty file (0 bytes of output).
-  const trimStart = Math.max(0, Number(acc.trimStart) || 0);
-  const trimDuration = Math.max(0, Number(acc.trimDuration) || 0);
-  // Re-encoding cuts frame-accurately, so it seeks to the exact requested point.
-  // A stream copy cannot: video can only start on a keyframe while audio would be cut
-  // precisely, which leaves the lead-in silent. So the copy path seeks nothing and just
-  // limits the length — both tracks start together at the keyframe before the request.
-  const exact = !!acc.transcode;
-  const seek = exact && trimStart > 0.05 ? ['-ss', trimStart.toFixed(3)] : [];
-  const limit = trimDuration > 0.05
-    ? ['-t', (exact ? trimDuration : trimStart + trimDuration).toFixed(3)]
-    : [];
-  const inV = (s) => (vName ? [...s, '-i', vName] : []);
-  const inA = (s) => [...s, '-i', aName];
+  // Trims arrive PER TRACK and are relative to each captured file's own beginning
+  // (ffmpeg's -ss counts from the file's start, not from the video's timeline). They
+  // are computed so both tracks begin at the same instant of the source: the captured
+  // audio usually starts seconds before the video keyframe, and muxing two files that
+  // begin at different instants makes ffmpeg zero each input separately, sliding the
+  // sound against the picture.
+  const videoSeek = Math.max(0, Number(acc.videoSeek) || 0);
+  const audioSeek = Math.max(0, Number(acc.audioSeek) || 0);
+  const audioDelay = Math.max(0, Number(acc.audioDelay) || 0);
+  const outDuration = Math.max(0, Number(acc.outDuration) || 0);
+  const limit = outDuration > 0.05 ? ['-t', outDuration.toFixed(3)] : [];
+  const inV = (trim) => (vName
+    ? [...(trim && videoSeek > 0.02 ? ['-ss', videoSeek.toFixed(3)] : []), '-i', vName]
+    : []);
+  const inA = (trim) => [
+    ...(trim && audioDelay > 0.02 ? ['-itsoffset', audioDelay.toFixed(3)] : []),
+    ...(trim && audioSeek > 0.02 ? ['-ss', audioSeek.toFixed(3)] : []),
+    '-i', aName,
+  ];
   // Stream copy can only cut on keyframes, so a trimmed copy starts at the keyframe
   // BEFORE the requested point. MP4 can hide that lead-in with an edit list, but the
   // skipped frames stay inside the file and players that take the duration from the
@@ -96,7 +98,7 @@ async function finalize() {
   if (isMp3) {
     runs.push({
       name: 'mp3', out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3',
-      args: [...inA(seek), ...limit, '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'],
+      args: [...inA(true), ...limit, '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'],
     });
   } else if (acc.transcode) {
     // Re-encode to H.264 + AAC. An automatic exact cut of a short clip favours speed
@@ -105,7 +107,7 @@ async function finalize() {
     const preset = acc.quickEncode ? 'ultrafast' : 'veryfast';
     runs.push({
       name: 'h264', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-      args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
+      args: [...inV(true), ...inA(true), '-map', '0:v:0', '-map', '1:a:0', ...limit,
         '-c:v', 'libx264', '-preset', preset, '-crf', '20', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', 'out.mp4'],
     });
@@ -113,15 +115,15 @@ async function finalize() {
     // Fast path: stream-copy the original tracks (VP9/Opus) into mp4 (seconds).
     runs.push({
       name: 'mp4-copy', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-      args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
+      args: [...inV(true), ...inA(true), '-map', '0:v:0', '-map', '1:a:0', ...limit,
         '-c', 'copy', '-strict', '-2', ...ZERO, '-movflags', '+faststart', 'out.mp4'],
     });
-    if (seek.length || limit.length) {
+    if (limit.length) {
       // If trimming upsets the copy path, keep the whole captured range rather than fail
       // (it covers the fragment, just aligned to segment boundaries).
       runs.push({
         name: 'mp4-copy-untrimmed', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-        args: [...inV([]), ...inA([]), '-map', '0:v:0', '-map', '1:a:0',
+        args: [...inV(true), ...inA(true), '-map', '0:v:0', '-map', '1:a:0',
           '-c', 'copy', '-strict', '-2', '-avoid_negative_ts', 'make_zero',
           '-movflags', '+faststart', 'out.mp4'],
       });
@@ -129,7 +131,7 @@ async function finalize() {
     // Last resort if mp4 refuses these codecs.
     runs.push({
       name: 'webm-copy', out: 'out.webm', type: 'video/webm', ext: '.webm',
-      args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
+      args: [...inV(true), ...inA(true), '-map', '0:v:0', '-map', '1:a:0', ...limit,
         '-c', 'copy', ...ZERO, 'out.webm'],
     });
   }
@@ -188,8 +190,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     acc.transcode = !!msg.transcode;
     acc.format = msg.format || 'mp4';
     acc.quickEncode = !!msg.quickEncode;
-    acc.trimStart = msg.trimStart || 0;
-    acc.trimDuration = msg.trimDuration || 0;
+    acc.videoSeek = msg.videoSeek || 0;
+    acc.audioSeek = msg.audioSeek || 0;
+    acc.audioDelay = msg.audioDelay || 0;
+    acc.outDuration = msg.outDuration || 0;
     // warm up ffmpeg while chunks stream in
     getFF().catch(() => {});
     sendResponse({ ok: true });

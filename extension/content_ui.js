@@ -290,6 +290,8 @@
       // RELATIVE to the captured file — ffmpeg's -ss counts from the file's own start,
       // not from the video's absolute timeline.
       const capturedFrom = typeof result.capturedFrom === 'number' ? result.capturedFrom : start;
+      const capV = typeof result.capturedFromVideo === 'number' ? result.capturedFromVideo : capturedFrom;
+      const capA = typeof result.capturedFromAudio === 'number' ? result.capturedFromAudio : capturedFrom;
       const trimStart = Math.max(0, start - capturedFrom);
       const trimDuration = Math.max(0, end - start);
       const isFragment = start > 0 || end < duration - 0.5;
@@ -309,6 +311,18 @@
           : (transcode ? 'Перекодирование в H.264 (может занять дольше ролика)…'
             : 'Склейка дорожек…')), 0.55);
 
+      // The two captured tracks do NOT begin at the same instant — YouTube's audio
+      // segment covering the requested point can start ~10s before the video keyframe.
+      // Muxing them as-is makes ffmpeg zero each input on its own, which slides the
+      // sound against the picture, so each track gets its own trim to a common instant.
+      // A copy has to keep the video's first keyframe; re-encoding can cut anywhere.
+      const base = isMp3 ? Math.max(start, capA)
+        : (doTranscode ? Math.max(start, capV, capA) : capV);
+      const videoSeek = Math.max(0, base - capV);
+      const audioSeek = Math.max(0, base - capA);
+      const audioDelay = Math.max(0, capA - base); // audio truly starts later → keep the gap
+      const outDuration = isFragment ? Math.max(0, end - base) : 0;
+
       const res = await muxViaOffscreen({
         format,
         video: isMp3 ? null : result._v,
@@ -316,9 +330,7 @@
         videoMime: result.video && result.video.mime,
         audioMime: result.audio && result.audio.mime,
         filename, transcode: doTranscode, quickEncode: exactCut && !transcode,
-        trimStart,
-        // only limit duration when a real fragment was requested
-        trimDuration: isFragment ? trimDuration : 0,
+        videoSeek, audioSeek, audioDelay, outDuration,
       });
 
       if (!res || !res.ok) throw new Error(res && res.error || 'mux failed');
@@ -387,7 +399,8 @@
       t: 'ytdl-begin', filename: job.filename, format: job.format,
       videoMime: job.videoMime, audioMime: job.audioMime,
       transcode: !!job.transcode, quickEncode: !!job.quickEncode,
-      trimStart: job.trimStart || 0, trimDuration: job.trimDuration || 0,
+      videoSeek: job.videoSeek || 0, audioSeek: job.audioSeek || 0,
+      audioDelay: job.audioDelay || 0, outDuration: job.outDuration || 0,
     });
 
     let seq = 0; // lets the receiver drop a repeated chunk instead of doubling the data
