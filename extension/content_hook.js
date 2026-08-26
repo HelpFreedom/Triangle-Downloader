@@ -148,6 +148,11 @@
   function video() { return document.querySelector('video'); }
   const Q = { 1080: 'hd1080', 720: 'hd720' };
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const clock = (sec) => {
+    sec = Math.max(0, Math.round(sec || 0));
+    const m = Math.floor(sec / 60), r = sec % 60;
+    return m + ':' + String(r).padStart(2, '0');
+  };
 
   function setQualityRaw(q) {
     const p = player();
@@ -237,11 +242,26 @@
     // like ordinary buffering to YouTube. Segments arrive strictly in order (verified:
     // monotonic cluster timecodes, no duplicates) because we only ever seek forward
     // to the contiguous edge.
-    const bufferedEndAt = (t) => {
-      for (let i = 0; i < v.buffered.length; i++) {
-        if (v.buffered.start(i) <= t + 0.5 && v.buffered.end(i) >= t) return v.buffered.end(i);
+    // Coverage is measured PER TRACK. The element's own `buffered` is the intersection
+    // of both source buffers and gets reshaped by eviction, which looked like a stall and
+    // made the capture stop early — handing back a clip whose picture ended before its
+    // sound. Both streams must genuinely reach the end of the requested range.
+    const coveredTo = (from) => {
+      let out = null;
+      for (const kind of (needVideo ? ['video', 'audio'] : ['audio'])) {
+        const sb = store.sb[kind];
+        if (!sb) return null;
+        let end = null;
+        try {
+          const b = sb.buffered;
+          for (let i = 0; i < b.length; i++) {
+            if (b.start(i) <= from + 0.6 && b.end(i) >= from) { end = b.end(i); break; }
+          }
+        } catch (e) { return null; } // detached after navigation
+        if (end == null) return null;
+        out = out == null ? end : Math.min(out, end);
       }
-      return t;
+      return out;
     };
     // Where the captured data actually begins: the player can only start at a segment
     // boundary at or before capStart, so the file may lead in by a few seconds. The
@@ -265,33 +285,47 @@
       if (v0 != null) firstVideoAt = firstVideoAt == null ? v0 : Math.min(firstVideoAt, v0);
       if (a0 != null) firstAudioAt = firstAudioAt == null ? a0 : Math.min(firstAudioAt, a0);
     };
-    let cursor = capStart, stall = 0;
+    // Everything between capStart and `frontier` is captured on every needed track.
+    let frontier = capStart, stall = 0, unsticking = false;
     const span = Math.max(0.1, capEnd - capStart);
+    const mediaEnd = isFinite(dur) && dur > 0 ? dur : capEnd;
     const started = Date.now();
     try {
       try { v.pause(); } catch (e) {}
       capturedFrom = Math.min(capStart, bufferedStartAt(capStart));
       noteTrackStarts();
       while (true) {
-        await sleep(350);
+        await sleep(300);
         if (vidId() !== capId) throw new Error('видео переключилось во время захвата');
-        try { if (!v.paused) v.pause(); } catch (e) {} // keep it paused; buffering runs anyway
-
-        const edge = bufferedEndAt(cursor);
-        onProgress(Math.min(0.99, Math.max(0, edge - capStart) / span));
-        if (edge >= capEnd - 0.6) break;                 // range fully buffered → captured
-
-        if (edge > cursor + 0.3) {                       // window extended → hop to the edge
-          cursor = edge;
-          seekVia(Math.min(cursor, capEnd - 0.1));
-          stall = 0;
-        } else {                                         // plateaued → nudge to re-trigger fetch
-          stall++;
-          if (stall % 4 === 0) seekVia(Math.min(cursor + 0.1, capEnd - 0.1));
-          if (stall >= 60) break;                        // ~21s with no progress → give up
-        }
-        if (Date.now() - started > 20 * 60 * 1000) break; // hard cap
         noteTrackStarts();
+
+        const edge = coveredTo(frontier);
+        if (edge != null && edge > frontier + 0.25) {
+          frontier = edge;
+          stall = 0;
+          if (unsticking) { unsticking = false; try { v.pause(); } catch (e) {} }
+          seekVia(Math.min(frontier, capEnd - 0.05));   // hop to the edge, pull the next window
+        } else {
+          stall++;
+          // A paused player sometimes stops fetching altogether. Re-seeking to the
+          // frontier usually restarts it; when it does not, letting the video PLAY always
+          // does — and playing only ever appends further forward, never re-appends.
+          if (!unsticking && stall % 5 === 0) seekVia(Math.min(frontier, capEnd - 0.05));
+          if (!unsticking && stall >= 12) { unsticking = true; try { await v.play(); } catch (e) {} }
+        }
+
+        // never let playback run past the fragment (or on into the next video)
+        if (v.currentTime >= capEnd - 0.4) { unsticking = false; try { v.pause(); } catch (e) {} }
+        if (!unsticking) { try { if (!v.paused) v.pause(); } catch (e) {} }
+
+        onProgress(Math.min(0.99, Math.max(0, frontier - capStart) / span));
+
+        if (frontier >= capEnd - 0.4) break;              // the whole range is captured
+        if (frontier >= mediaEnd - 1.5) break;            // reached the end of the media itself
+        // a stream can simply end a couple of seconds before its declared duration
+        if (stall >= 25 && frontier >= mediaEnd - 3) break;
+        if (stall >= 200) break;                          // ~60s without a single new byte
+        if (Date.now() - started > 30 * 60 * 1000) break; // hard cap
       }
       capturedFrom = Math.min(capturedFrom, bufferedStartAt(capStart));
       noteTrackStarts();
@@ -304,11 +338,19 @@
       keepAutoplayOff(); // leave autoplay disabled — don't turn it back on
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
+    // The user asked for a specific range: deliver it or say so. Returning what happened
+    // to arrive would produce a clip whose picture stops before its sound.
+    const complete = frontier >= capEnd - 0.5 || frontier >= mediaEnd - 3;
+    if (!complete) {
+      throw new Error('не удалось загрузить фрагмент целиком — получено до '
+        + clock(frontier) + ' из ' + clock(capEnd) + '. Попробуйте ещё раз');
+    }
     onProgress(1);
     return {
       capturedFrom: Math.max(0, capturedFrom),
       capturedFromVideo: firstVideoAt == null ? null : Math.max(0, firstVideoAt),
       capturedFromAudio: firstAudioAt == null ? null : Math.max(0, firstAudioAt),
+      capturedTo: frontier,
     };
   }
 
